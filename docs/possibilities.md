@@ -68,3 +68,33 @@ Ideas that fit SimTara's design but are not built yet. Each says what already ex
 
 **Business**
 - Hosted compute for big sweeps, an enterprise tier with access control, and a library of paid modules and universes.
+
+## 4. Story games on a living universe
+
+**Idea.** Use a universe's current state as the world of a story game. Each player action is a command; the simulation reacts, so outcomes differ without a writer scripting every branch. Same seed + same choices = same story, which makes runs replayable and shareable.
+
+**How it maps onto what exists**
+- World state: things, relations, rules.
+- Player actions: commands (`set_param`, `spawn`, `set`), limited by roles ("you are the fire chief").
+- Story beats: `on_tick` reads metrics and logs messages ("the fire crossed the river").
+- Endings: checks such as `cells burning > 100` become win and lose conditions.
+- Determinism: a seed and a record of choices reproduce a story exactly.
+
+**Missing for a real game**
+1. A player view instead of the developer Studio: narration text, a few choices or sliders, a map or 3D picture.
+2. A story and event layer: named events, conditions, text templates, a queue so only a few beats show per turn. Today there is only `log`.
+3. Turn structure: "run until something happens or N ticks, then report".
+4. Save points and undo: checkpoints plus the input log (same foundation as branching, see `technical-direction.md`), so a player can rewind to a choice.
+5. What the player can see: per-role visibility with delay and noise, so a character knows only what they would know.
+6. Optional AI narrator: a language model turns structured events and state into prose. The simulation stays the source of truth; the narrator describes, never decides, and is given only structured facts to limit invented details.
+
+**Can it be done now?** A rough prototype is possible today with Luau, a role, `on_tick` beats and checks. A real game needs items 1 to 5 above; the player view and the event layer are the largest costs.
+
+**Design tension.** Pure emergence can feel flat because simulations lack dramatic timing. A *director* rule layer (raise the fire when the player is winning too easily, hold back disasters after one) adds pacing without scripting outcomes, and fits the rule system.
+
+**Related branching features** (also in `technical-direction.md`)
+- *Intervene*: a recorded one-off state edit.
+- *Branch*: fork at a checkpoint, run independently, compare, adopt or discard. In a game this is "what would have happened if I had chosen the other way?"
+- *Twin*: a branch that keeps following the main universe with a persistent difference; later.
+
+**Open question.** Text-and-choices or a visual (3D) world? That decides the amount of player-view work more than anything else.
