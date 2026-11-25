@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.2.0
+
+- New `simtara-studio` app: launcher with parameter sliders, then live universe with control panel (play/pause, live laws, particle count, CPU/GPU, metrics graph).
 
 - New `simtara-api` crate: JSON control interface (create/run/observe/configure/branch/snapshot worlds) for CLI, Studio and AI agents. `simtara serve` speaks it as JSON lines over stdin/stdout.
 - Core: metric registry (`Builder::add_metric`, `Simulation::collect_metrics`); particles register `particles.count`, `particles.kinetic_energy`, `particles.mean_neighbors`.
@@ -19,4 +21,4 @@ First release.
   live-tunable parameters.
 - `simtara-cli`: `simtara run` (headless, save/load/PNG) and `simtara view` (live window).
 
-Not yet implemented: GPU backend (wgpu), slider UI.
+Not yet implemented in v0.1.0: GPU backend, slider UI (both added in v0.2.0).

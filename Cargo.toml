@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/simtara-core", "crates/simtara-particles", "crates/simtara-gpu", "crates/simtara-api", "crates/simtara-cli"]
+members = ["crates/simtara-core", "crates/simtara-particles", "crates/simtara-gpu", "crates/simtara-api", "crates/simtara-cli", "crates/simtara-studio"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 

@@ -1,0 +1,15 @@
+[package]
+name = "simtara-studio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "simtara-studio"
+path = "src/main.rs"
+
+[dependencies]
+simtara-core = { path = "../simtara-core" }
+simtara-particles = { path = "../simtara-particles" }
+simtara-gpu = { path = "../simtara-gpu" }
+eframe = "0.37"
