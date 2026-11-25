@@ -18,16 +18,17 @@ function setup()
   param{name = "ambient", value = 20, min = 0, max = 40, about = "air temperature", owner = "nature"}
 
   -- what the fire crew can do: spray water on burning cells, and clear fuel next to the fire
-  param{name = "water_drop", value = 0, min = 0, max = 5, about = "water sprayed on burning cells", owner = "firefighters"}
-  param{name = "fuel_clearing", value = 0, min = 0, max = 5, about = "fuel cleared near the fire (a firebreak)", owner = "firefighters"}
+  param{name = "water_drop", value = 0, min = 0, max = 5, about = "water sprayed on burning cells (costs water)", owner = "firefighters"}
+  param{name = "crews", value = 0, min = 0, max = 30, about = "ground crews cutting a firebreak (each costs 10 per tick)", owner = "firefighters"}
 
+  spawn{kind = "ops", props = {spent = 0}}
   local id = {}
   for gy = 0, N - 1 do
     for gx = 0, N - 1 do
       local river = (gx >= 28 and gx <= 30) and gy > 10
       local fuel = river and 0 or (0.5 + random() * 0.5)
       local spark = (gx - 12) ^ 2 + (gy - 30) ^ 2 < 4
-      id[gy * N + gx] = spawn{kind = "cell", props = {x = gx, y = gy, fuel = fuel, temp = spark and 600 or 20, burning = 0}}
+      id[gy * N + gx] = spawn{kind = "cell", props = {x = gx, y = gy, fuel = fuel, temp = spark and 600 or 20, burning = 0, water_used = 0}}
     end
   end
   for gy = 0, N - 1 do
@@ -50,11 +51,17 @@ function setup()
   add_rule{name = "heat_flow", kind = "cell", set = {
     temp = "max(ambient, temp + conduction * (nmean(next, temp) - temp) - air_cooling * (temp - ambient) - rain * 0.15 * (temp - ambient))"}}
 
-  add_rule{name = "water", kind = "cell", set = {temp = "max(ambient, temp - water_drop * 25 * burning)"}}
-  add_rule{name = "clear", kind = "cell", set = {fuel = "if(temp > 60 and burning < 1, max(0, fuel - fuel_clearing * 0.05), fuel)"}}
+  -- each crew gets to a few cells near the fire per tick, chance-based, so more crews = bigger firebreak
+  add_rule{name = "water", kind = "cell", set = {
+    water_used = "water_used + water_drop * burning",
+    temp = "max(ambient, temp - water_drop * 25 * burning)"}}
+  add_rule{name = "clear", kind = "cell", set = {fuel = "if(temp > 60 and burning < 1 and random() < crews * 0.02, 0, fuel)"}}
+  add_rule{name = "pay", kind = "ops", set = {spent = "spent + crews * 10"}}
 
   define_metric{name = "cells burning", kind = "cell", prop = "burning", op = "sum"}
   define_metric{name = "fuel left", kind = "cell", prop = "fuel", op = "sum"}
+  define_metric{name = "crew cost", kind = "ops", prop = "spent", op = "sum"}
+  define_metric{name = "water used", kind = "cell", prop = "water_used", op = "sum"}
   define_metric{name = "hottest cell", kind = "cell", prop = "temp", op = "max"}
   view{x = "x", y = "y", color = "temp", size = "fuel"}
 end
