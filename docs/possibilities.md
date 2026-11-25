@@ -164,3 +164,87 @@ SimTara should not compete with ML frameworks. Training a real model needs tenso
 1. Competitions and teaching: little new engineering (checks, packages, a leaderboard) and they build a community.
 2. Chaos testing for software: a market with money, matching the determinism the core already has.
 3. Policy and planning demos: good stories for people who do not write code.
+
+## 8. The long list
+
+Everything below fits the same shape: things with properties, relations, rules, controls, roles, metrics, and experiments to compare changes. "Have" means an example or module exists today; the rest would be a script or a module, sometimes with the engine work listed in `technical-direction.md`.
+
+**Physics and maths**
+- Heat on a plate (have), waves and ripples, diffusion, percolation, sandpiles, Ising model and phase changes.
+- Cellular automata: Game of Life, rule 110, forest-fire models, traffic automata.
+- Orbits and gravity (have), n-body clusters, tides, simple planetary systems.
+- Particles, charges and boundaries (have), gas in a box, Brownian motion.
+- Toy fluids and smoke on a grid; pendulums and chaos; springs and cloth with a coarse model.
+- Random walks, Monte Carlo estimation, queueing theory, network flow.
+
+**Chemistry and biology**
+- Reaction-diffusion patterns (have), reaction networks, simple enzyme kinetics.
+- Forest fire with fuel, heat, oxygen, crews and water (have).
+- Population dynamics: predator and prey, competition, carrying capacity, extinction.
+- Evolution: mutation, selection, drift, speciation on a landscape.
+- Epidemics with towns, vaccines, masks, travel (have: an epidemic and towns and a disease).
+- Cells and tissue: growth, wound healing, tumour growth, morphogenesis, gene regulatory networks.
+- Ecosystems and food webs; invasive species; fisheries and quotas.
+- Neurons and simple circuits (toy models for teaching).
+- Pollination, pests, crop growth, irrigation, soil and weather.
+
+**Earth and environment**
+- Toy climate and carbon cycle; heat islands; sea-level and flooding on a height map.
+- Wildfire, flood, drought and landslide scenarios on real terrain (needs maps).
+- Water systems: reservoirs, pipes, leaks, rationing.
+- Energy grids: supply and demand, storage, outages, price rules.
+- Waste, recycling and pollution spread.
+
+**Society and economy**
+- An idea spreads (have); rumours and misinformation; fact-checking as a role.
+- Opinions and voting, polarisation, coalition formation.
+- Markets, auctions, bubbles and crashes; banks and contagion; inflation toy models.
+- Cities: land use, housing, commuting, zoning, gentrification.
+- Traffic, public transport, bike lanes, parking, congestion pricing.
+- Crowds, evacuation, stadium exits, queues at airports and hospitals.
+- Supply chains, warehouses, delivery routes, breakdowns, shortages.
+- Labour and organisations: teams, handoffs, bottlenecks, burnout.
+- Tragedy of the commons, public goods, cooperation, trust, fairness games.
+- Language and culture: words that spread, dialects, naming trends, fashion cycles.
+- History what-ifs and archaeology scenarios (settlements, trade routes, collapse).
+
+**Health and public services**
+- Hospital beds, triage and staffing; ambulance placement; waiting lists.
+- Vaccination and screening policy; contact tracing; outbreak drills.
+- Disaster response: roles for command, crews and the public, with limited water, money and people.
+
+**Software, security and systems**
+- Chaos testing of distributed systems with deterministic failures.
+- Load tests and capacity planning: users, servers, caches, queues.
+- Worm and malware spread, attack and defence games, patch policy.
+- A/B test simulators and statistical power checks.
+- Synthetic data generators with known ground truth, for testing analytics and models.
+- Robot swarms, warehouse robots, drone coverage, multi-agent path finding.
+
+**Games and creativity**
+- Story games on a living world (section 4), roguelike worlds, city builders, tycoon games.
+- Procedural worlds: terrain, rivers, towns, histories, then play them.
+- Game balance testing: run thousands of seeded matches and compare strategies.
+- Generative art, evolving patterns, music from metrics, videos (section 1).
+- Interactive fiction where weather, markets and rumours keep running.
+
+**Education and research**
+- Classroom kits for physics, biology, economics, civics, and computing, with predict-then-run checks.
+- Reproducible research packages: a paper's model, data and seeds in one `.simtara` file.
+- Sensitivity analysis, ensembles, calibration to data, uncertainty ranges.
+- Peer comparison: two labs run the same package and compare results.
+- Open competitions and challenges with leaderboards.
+
+**Agents and AI**
+- Arenas where AI agents act through commands and are scored; human versus agent runs.
+- Language models as narrators, game masters or role-players, never deciding outcomes.
+- Multi-agent negotiation, markets and cooperation tests.
+- Safety drills: how an agent behaves when a control is locked, a budget runs out, or information is delayed.
+
+**Business and platform**
+- Digital twins of factories, networks and buildings fed by real data.
+- Planning tools for governments, utilities and companies; scenario libraries.
+- A marketplace for universes and modules; enterprise access control; hosted compute for sweeps.
+- Embeds: a universe inside a web page, a notebook, a slide or a dashboard.
+
+**What decides what is next.** Pick uses that reuse the same engine work: the input log, branching and compare, the headless renderer, bulk spawn and spatial queries, and per-role visibility. Each of those unlocks many items above at once.
