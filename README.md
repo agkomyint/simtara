@@ -46,3 +46,7 @@ pause/resume/reset ✅ · visualization ✅ · module interface ✅.
 **GPU:** the `Compute` abstraction (`Backend::Cpu | Gpu`, with CPU fallback) is in the core, but
 there is no GPU backend yet. Next step is a `simtara-gpu` crate (wgpu + WGSL) that registers
 `Backend::Gpu` and a GPU force kernel for the particle module.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
