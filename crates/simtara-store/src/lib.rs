@@ -365,7 +365,7 @@ pub fn get_parameter(sim: &Simulation, field: &str) -> Option<f64> {
     serde_json::to_value(p).ok()?.get(field)?.as_f64()
 }
 
-fn run_arm(start: &Snapshot, spec: &ExperimentSpec, label: &str, value: f64, changed: bool) -> Result<Series, String> {
+fn arm_sim(start: &Snapshot, spec: &ExperimentSpec, value: f64, changed: bool) -> Result<Simulation, String> {
     let mut sim = from_snapshot(start)?;
     // CPU on purpose: CPU runs repeat exactly, GPU runs are only approximately repeatable.
     sim.compute_mut().set_requested(Backend::Cpu);
@@ -374,26 +374,35 @@ fn run_arm(start: &Snapshot, spec: &ExperimentSpec, label: &str, value: f64, cha
         (Some(_), false) => {}
         (None, _) => set_parameter(&mut sim, &spec.parameter, value)?,
     }
+    Ok(sim)
+}
+
+fn sample(sim: &Simulation, metric: &str) -> Result<[f64; 2], String> {
+    let v = *sim.collect_metrics().get(metric).ok_or_else(|| format!("unknown metric '{metric}'"))?;
+    Ok([sim.world().clock.tick as f64, v])
+}
+
+/// Run the original and the changed version side by side. `progress` is called after every sample
+/// with the two series so far, so a screen can draw the lines as they grow.
+pub fn run_experiment_live(start: &Snapshot, spec: &ExperimentSpec, progress: &mut dyn FnMut(&[Series])) -> Result<ExperimentResult, String> {
+    let t0 = Instant::now();
+    let mut sims = [arm_sim(start, spec, spec.base_value, false)?, arm_sim(start, spec, spec.alt_value, true)?];
+    let mut series = vec![
+        Series { label: "original".into(), value: spec.base_value, points: vec![sample(&sims[0], &spec.metric)?] },
+        Series { label: "changed".into(), value: spec.alt_value, points: vec![sample(&sims[1], &spec.metric)?] },
+    ];
+    progress(&series);
     let every = spec.sample_every.max(1);
-    let sample = |sim: &Simulation| -> Result<[f64; 2], String> {
-        let v = *sim.collect_metrics().get(&spec.metric).ok_or_else(|| format!("unknown metric '{}'", spec.metric))?;
-        Ok([sim.world().clock.tick as f64, v])
-    };
-    let mut points = vec![sample(&sim)?];
     let mut done = 0;
     while done < spec.ticks {
         let n = every.min(spec.ticks - done);
-        sim.advance(n);
+        for (sim, s) in sims.iter_mut().zip(series.iter_mut()) {
+            sim.advance(n);
+            s.points.push(sample(sim, &spec.metric)?);
+        }
         done += n;
-        points.push(sample(&sim)?);
+        progress(&series);
     }
-    Ok(Series { label: label.to_string(), value, points })
-}
-
-/// Run both arms (original value and changed value) from the same start state.
-pub fn run_experiment(start: &Snapshot, spec: &ExperimentSpec) -> Result<ExperimentResult, String> {
-    let t0 = Instant::now();
-    let series = vec![run_arm(start, spec, "original", spec.base_value, false)?, run_arm(start, spec, "changed", spec.alt_value, true)?];
     Ok(ExperimentResult {
         schema_version: SCHEMA_VERSION,
         series,
@@ -407,7 +416,10 @@ pub fn run_experiment(start: &Snapshot, spec: &ExperimentSpec) -> Result<Experim
     })
 }
 
-/// Fill in a spec for "change `parameter` from its current value to `alt_value`".
+pub fn run_experiment(start: &Snapshot, spec: &ExperimentSpec) -> Result<ExperimentResult, String> {
+    run_experiment_live(start, spec, &mut |_| {})
+}
+
 pub fn new_spec(id: String, sim: &Simulation, parameter: &str, alt_value: f64, ticks: u64) -> Result<ExperimentSpec, String> {
     let base_value = get_parameter(sim, parameter).ok_or_else(|| format!("unknown parameter '{parameter}'"))?;
     let label = PARAMETERS.iter().find(|p| p.0 == parameter).map_or(parameter, |p| p.1);

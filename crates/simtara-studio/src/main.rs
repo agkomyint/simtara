@@ -38,7 +38,11 @@ struct Launch {
     use_gpu: bool,
 }
 
-type ExperimentJob = Receiver<Result<(Experiment, Snapshot), String>>;
+enum JobMsg {
+    Progress(Vec<simtara_store::Series>),
+    Done(Result<(Experiment, Snapshot), String>),
+}
+type ExperimentJob = Receiver<JobMsg>;
 
 struct Running {
     sim: Simulation,
@@ -56,6 +60,7 @@ struct Running {
     experiments: Vec<Experiment>,
     selected: Option<usize>,
     job: Option<ExperimentJob>,
+    live: Option<Experiment>,
     exp_param: usize,
     exp_alt: f64,
     exp_ticks: u64,
@@ -161,6 +166,7 @@ impl Running {
             experiments: Vec::new(),
             selected: None,
             job: None,
+            live: None,
             exp_param: 0,
             exp_alt: 0.0,
             exp_ticks: if orbits { 1461 } else { 2000 },
@@ -300,11 +306,21 @@ impl Running {
         })();
         match result {
             Ok((spec, start)) => {
+                let spec_for_live = spec.clone();
                 let (tx, rx) = channel();
                 std::thread::spawn(move || {
-                    let out = simtara_store::run_experiment(&start, &spec).map(|result| (Experiment { spec, result }, start));
-                    let _ = tx.send(out);
+                    let txp = tx.clone();
+                    let out = simtara_store::run_experiment_live(&start, &spec, &mut |s| {
+                        let _ = txp.send(JobMsg::Progress(s.to_vec()));
+                    })
+                    .map(|result| (Experiment { spec, result }, start));
+                    let _ = tx.send(JobMsg::Done(out));
                 });
+                self.live = Some(Experiment {
+                    spec: spec_for_live,
+                    result: simtara_store::ExperimentResult { schema_version: 0, series: Vec::new(), record: simtara_store::RunRecord { engine_version: String::new(), seed: 0, backend: "cpu".into(), start_tick: 0, millis: 0 } },
+                });
+                self.selected = None;
                 self.job = Some(rx);
                 self.status = "experiment running...".into();
             }
@@ -315,8 +331,23 @@ impl Running {
     /// Collect a finished experiment (if any) and write it to disk.
     fn poll_experiment(&mut self, store: &Store) {
         let Some(rx) = &self.job else { return };
-        let Ok(out) = rx.try_recv() else { return };
+        let mut finished = None;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                JobMsg::Progress(series) => {
+                    if let Some(l) = self.live.as_mut() {
+                        l.result.series = series;
+                    }
+                }
+                JobMsg::Done(out) => {
+                    finished = Some(out);
+                    break;
+                }
+            }
+        }
+        let Some(out) = finished else { return };
         self.job = None;
+        self.live = None;
         match out {
             Ok((exp, start)) => {
                 let name = self.saved_as.clone().unwrap_or_default();
@@ -865,7 +896,16 @@ impl eframe::App for Studio {
                     run.run_experiment(&self.store);
                 }
 
-                if let Some(i) = run.selected {
+                if let Some(live) = &run.live {
+                    egui::Panel::bottom("results").resizable(false).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            let have = live.result.series.first().map_or(0, |s| s.points.len());
+                            ui.strong(format!("Running {} · {} samples so far", live.spec.name, have));
+                        });
+                        draw_chart(ui, live);
+                    });
+                } else if let Some(i) = run.selected {
                     let mut close = false;
                     egui::Panel::bottom("results").resizable(false).show(ui, |ui| {
                         ui.horizontal(|ui| {
