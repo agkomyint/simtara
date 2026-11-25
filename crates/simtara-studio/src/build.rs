@@ -11,9 +11,11 @@ use simtara_store::{Store, TEMPLATE_BUILD};
 use simtara_things::Things;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXAMPLES: [(&str, &str, &str); 4] = [
+pub const EXAMPLES: [(&str, &str, &str); 6] = [
     ("Empty universe", "A blank page with a few hints. Describe what exists, then the rules.", EMPTY),
     ("An idea spreads", "1,500 people, 3 of them know an idea. Each tells friends. No physics at all.", IDEA),
+    ("Heat on a plate", "A 40x40 plate with a hot square in the middle. Heat spreads to neighbours. Watch the picture.", HEAT),
+    ("Towns and a disease", "Four towns of people, mostly meeting their own town. Watch the disease jump between towns.", TOWNS),
     ("Typed (Luau types)", "The same crowd, written with Luau type annotations so mistakes are caught early.", TYPED),
     ("An epidemic", "A disease moving through contacts: people get sick, then immune.", EPIDEMIC),
 ];
@@ -52,6 +54,67 @@ function setup()
   add_rule{name = "spread", kind = "person",
            when = "knows == 0 and random() < 0.12 * ncount(friend, knows)",
            set = {knows = "true"}}
+end
+"##;
+
+const HEAT: &str = r##"-- Heat spreading across a plate. Each cell sits at (x, y) and touches its 4 neighbours.
+-- view{...} says how to draw it: x and y place the cells, color shows the property "heat".
+local N = 40
+
+function setup()
+  local id = {}
+  for gy = 0, N - 1 do
+    for gx = 0, N - 1 do
+      local hot = gx >= 18 and gx < 22 and gy >= 18 and gy < 22
+      id[gy * N + gx] = spawn{kind = "cell", props = {x = gx, y = gy, heat = hot and 100 or 0}}
+    end
+  end
+  for gy = 0, N - 1 do
+    for gx = 0, N - 1 do
+      local me = id[gy * N + gx]
+      if gx > 0 then relate{from = me, to = id[gy * N + gx - 1], kind = "next"} end
+      if gx < N - 1 then relate{from = me, to = id[gy * N + gx + 1], kind = "next"} end
+      if gy > 0 then relate{from = me, to = id[(gy - 1) * N + gx], kind = "next"} end
+      if gy < N - 1 then relate{from = me, to = id[(gy + 1) * N + gx], kind = "next"} end
+    end
+  end
+  add_rule{name = "diffuse", kind = "cell", set = {heat = "heat + 0.22 * (nmean(next, heat) - heat)"}}
+  define_metric{name = "total heat", kind = "cell", prop = "heat", op = "sum"}
+  define_metric{name = "hottest", kind = "cell", prop = "heat", op = "max"}
+  view{x = "x", y = "y", color = "heat"}
+end
+"##;
+
+const TOWNS: &str = r##"-- Four towns. state: 0 healthy, 1 sick, 2 immune. x,y place people, colour is the state.
+local PER_TOWN = 400
+local CENTRES = {{-6, -6}, {6, -6}, {-6, 6}, {6, 6}}
+
+function setup()
+  local towns = {}
+  for t = 1, 4 do
+    towns[t] = {}
+    for i = 1, PER_TOWN do
+      local sick = (t == 1 and i <= 4)
+      towns[t][i] = spawn{kind = "person", props = {
+        x = CENTRES[t][1] + (random() - 0.5) * 8, y = CENTRES[t][2] + (random() - 0.5) * 8,
+        sick = sick, immune = false, state = sick and 1 or 0}}
+    end
+  end
+  for t = 1, 4 do
+    for i = 1, PER_TOWN do
+      for _ = 1, 5 do
+        -- 92% of contacts are in your own town, 8% travel
+        local town = (random() < 0.92) and t or (1 + math.floor(random() * 4))
+        relate{from = towns[t][i], to = towns[town][1 + math.floor(random() * PER_TOWN)], kind = "contact"}
+      end
+    end
+  end
+  add_rule{name = "infect", kind = "person", when = "sick == 0 and immune == 0 and random() < 0.07 * ncount(contact, sick)", set = {sick = "true"}}
+  add_rule{name = "recover", kind = "person", when = "sick == 1 and random() < 0.04", set = {sick = "false", immune = "true"}}
+  add_rule{name = "label", kind = "person", set = {state = "sick + immune * 2"}}
+  define_metric{name = "sick", kind = "person", prop = "sick", op = "sum"}
+  define_metric{name = "immune", kind = "person", prop = "immune", op = "sum"}
+  view{x = "x", y = "y", color = "state"}
 end
 "##;
 
@@ -109,7 +172,7 @@ end
 "##;
 
 /// (title, what it does, what to type)
-const REFERENCE: [(&str, &str, &str); 16] = [
+const REFERENCE: [(&str, &str, &str); 17] = [
     ("spawn", "Create a thing. Returns its id.", "local id = spawn{kind = \"person\", props = {age = 30, mood = \"calm\"}}"),
     ("despawn", "Remove a thing (and its relations).", "despawn(id)"),
     ("set", "Change properties of one thing.", "set{id = id, props = {age = 31}}"),
@@ -124,6 +187,7 @@ const REFERENCE: [(&str, &str, &str); 16] = [
     ("add_rule", "A formula run natively on every thing of a kind, each tick. Fast for huge crowds.", "add_rule{name = \"age\", kind = \"person\", set = {age = \"age + 1\"}, remove_when = \"age > 90\"}"),
     ("rule formulas", "Numbers, + - * / %, == != < > <= >=, and or not, if(c,a,b), min max abs sqrt floor clamp, random(), tick(), id, kind.", "when = \"energy < 1 and random() < 0.1\""),
     ("neighbours", "ncount(rel[,prop]) nsum nmean nmax nmin wsum wmean over the things this one points at.", "when = \"ncount(friend, knows) > 2\""),
+    ("view", "How to draw things in the Universe tab. Each field names a property; links draws relations.", "view{x = \"x\", y = \"y\", color = \"heat\", size = \"mass\", links = true}"),
     ("random", "A repeatable random number 0..1 (never math.random).", "if random() < 0.5 then end"),
     ("log", "Print a line to the Messages box below the editor.", "log(\"tick\", t)"),
 ];
@@ -134,6 +198,7 @@ const KEYWORDS: [&str; 22] = [
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
+    World,
     Charts,
     Things,
     Rules,
@@ -156,6 +221,12 @@ pub struct BuildView {
     last_tick: Option<u64>,
     ms: f32,
     commands: Vec<String>,
+    pan: egui::Vec2,
+    zoom: f32,
+    /// x, y, colour, size chosen in the picture (None = what the script said; empty = none)
+    pick: [Option<String>; 4],
+    show_links: Option<bool>,
+    selected: Option<u64>,
     test_ticks: u64,
     test_checks: String,
     report: Option<Value>,
@@ -186,7 +257,12 @@ impl BuildView {
             history: BTreeMap::new(),
             shown: BTreeSet::new(),
             shown_ready: false,
-            tab: Tab::Charts,
+            tab: Tab::World,
+            pan: egui::Vec2::ZERO,
+            zoom: 1.0,
+            pick: Default::default(),
+            show_links: None,
+            selected: None,
             kind_filter: String::new(),
             last_tick: None,
             ms: 0.0,
@@ -372,12 +448,13 @@ impl BuildView {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                for (tab, label) in [(Tab::Charts, "📈 Measurements"), (Tab::Things, "🧩 Things"), (Tab::Rules, "📏 Rules"), (Tab::Test, "✅ Test"), (Tab::Reference, "📖 Reference")] {
+                for (tab, label) in [(Tab::World, "🌍 Universe"), (Tab::Charts, "📈 Measurements"), (Tab::Things, "🧩 Things"), (Tab::Rules, "📏 Rules"), (Tab::Test, "✅ Test"), (Tab::Reference, "📖 Reference")] {
                     ui.selectable_value(&mut self.tab, tab, label);
                 }
             });
             ui.separator();
             match self.tab {
+                Tab::World => self.world_view(ui),
                 Tab::Charts => self.charts(ui),
                 Tab::Things => self.things(ui),
                 Tab::Rules => self.rules(ui),
@@ -386,6 +463,218 @@ impl BuildView {
             }
         });
         back
+    }
+
+    /// A picture of the things: x and y place them, colour and size show a property.
+    fn world_view(&mut self, ui: &mut egui::Ui) {
+        let Some(t) = self.sim.world().get::<Things>() else {
+            ui.weak("This universe has no things to draw.");
+            return;
+        };
+        if t.things.is_empty() {
+            ui.weak("Nothing exists yet. Create things with spawn{...} in setup().");
+            return;
+        }
+        let mut props: BTreeSet<&str> = BTreeSet::new();
+        for th in t.things.values().take(500) {
+            props.extend(th.props.keys().map(String::as_str));
+        }
+        let from_view = [t.view.x.clone(), t.view.y.clone(), t.view.color.clone(), t.view.size.clone()];
+        let mut chosen: [Option<String>; 4] = Default::default();
+        for i in 0..4 {
+            chosen[i] = match &self.pick[i] {
+                Some(p) if p.is_empty() => None,
+                Some(p) => Some(p.clone()),
+                None => from_view[i].clone(),
+            };
+        }
+        // properties literally called x and y make a map without being asked
+        for (i, name) in [(0usize, "x"), (1, "y")] {
+            if chosen[i].is_none() && self.pick[i].is_none() && props.contains(name) {
+                chosen[i] = Some(name.to_string());
+            }
+        }
+        let mut links_on = self.show_links.unwrap_or(t.view.links);
+        let mut new_pick = self.pick.clone();
+        ui.horizontal_wrapped(|ui| {
+            for (i, label) in ["x", "y", "colour", "size"].iter().enumerate() {
+                ui.label(*label);
+                let none_label = if i < 2 { "grid layout" } else { "none" };
+                egui::ComboBox::from_id_salt(("pick", i)).width(90.0).selected_text(chosen[i].clone().unwrap_or_else(|| none_label.to_string())).show_ui(ui, |ui| {
+                    if ui.selectable_label(chosen[i].is_none(), none_label).clicked() {
+                        new_pick[i] = Some(String::new());
+                    }
+                    for p in &props {
+                        if ui.selectable_label(chosen[i].as_deref() == Some(*p), *p).clicked() {
+                            new_pick[i] = Some(p.to_string());
+                        }
+                    }
+                });
+            }
+            ui.checkbox(&mut links_on, "links");
+            if ui.small_button("reset view").clicked() {
+                self.pan = egui::Vec2::ZERO;
+                self.zoom = 1.0;
+            }
+        });
+        for i in 0..4 {
+            if new_pick[i] != self.pick[i] {
+                chosen[i] = new_pick[i].clone().filter(|s| !s.is_empty());
+            }
+        }
+        let num = |th: &simtara_things::Thing, p: &Option<String>| -> Option<f64> {
+            match th.props.get(p.as_deref()?)? {
+                Value::Number(n) => n.as_f64(),
+                Value::Bool(b) => Some(*b as u8 as f64),
+                _ => None,
+            }
+        };
+        let n = t.things.len();
+        let side = (n as f64).sqrt().ceil().max(1.0);
+        let pts: Vec<(u64, [f64; 2], &simtara_things::Thing)> = t
+            .things
+            .values()
+            .enumerate()
+            .map(|(i, th)| {
+                let gx = (i as f64) % side;
+                let gy = (i as f64 / side).floor();
+                (th.id, [num(th, &chosen[0]).unwrap_or(gx), num(th, &chosen[1]).unwrap_or(gy)], th)
+            })
+            .collect();
+        let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for (_, p, _) in &pts {
+            x0 = x0.min(p[0]);
+            x1 = x1.max(p[0]);
+            y0 = y0.min(p[1]);
+            y1 = y1.max(p[1]);
+        }
+        // colour: a number gets a gradient; a few whole numbers or text get distinct colours
+        let (mut lo, mut hi, mut distinct) = (f64::MAX, f64::MIN, BTreeSet::new());
+        let mut all_small_ints = true;
+        if chosen[2].is_some() {
+            for (_, _, th) in pts.iter().take(5000) {
+                if let Some(v) = num(th, &chosen[2]) {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                    all_small_ints &= v.fract() == 0.0;
+                    if distinct.len() < 20 {
+                        distinct.insert(v as i64);
+                    }
+                }
+            }
+        }
+        let discrete = all_small_ints && distinct.len() <= 8;
+        let (mut slo, mut shi) = (f64::MAX, f64::MIN);
+        if chosen[3].is_some() {
+            for (_, _, th) in pts.iter().take(5000) {
+                if let Some(v) = num(th, &chosen[3]) {
+                    slo = slo.min(v);
+                    shi = shi.max(v);
+                }
+            }
+        }
+        let color_of = |th: &simtara_things::Thing| -> egui::Color32 {
+            match &chosen[2] {
+                None => hash_color(&th.kind),
+                Some(p) => match th.props.get(p) {
+                    Some(Value::String(s)) => hash_color(s),
+                    _ => match num(th, &chosen[2]) {
+                        Some(v) if discrete => PALETTE[(v as i64).rem_euclid(PALETTE.len() as i64) as usize],
+                        Some(v) => heat_color(if hi > lo { (v - lo) / (hi - lo) } else { 0.0 }),
+                        None => egui::Color32::GRAY,
+                    },
+                },
+            }
+        };
+        let base = if n > 50_000 { 1.2 } else if n > 5_000 { 2.0 } else if n > 800 { 3.0 } else { 5.0 };
+
+        let size = ui.available_size_before_wrap();
+        let (resp, painter) = ui.allocate_painter(egui::vec2(size.x, (size.y - 10.0).max(200.0)), egui::Sense::click_and_drag());
+        let rect = resp.rect;
+        painter.rect_filled(rect, 4.0, egui::Color32::from_gray(14));
+        if resp.dragged() {
+            self.pan += resp.drag_delta();
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let f = (1.0 + scroll * 0.0015).clamp(0.5, 2.0);
+                let anchor = ui.input(|i| i.pointer.hover_pos()).unwrap_or(rect.center());
+                let before = anchor - rect.center() - self.pan;
+                self.zoom = (self.zoom * f).clamp(0.2, 400.0);
+                self.pan += before - before * f;
+            }
+        }
+        let (w, h) = (((x1 - x0).max(1e-9)) as f32, ((y1 - y0).max(1e-9)) as f32);
+        let fit = ((rect.width() - 30.0) / w).min((rect.height() - 30.0) / h);
+        let scale = fit * self.zoom;
+        let (cx, cy) = ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0);
+        let pan = self.pan;
+        let to_screen = |p: [f64; 2]| egui::pos2(rect.center().x + pan.x + (p[0] as f32 - cx) * scale, rect.center().y + pan.y - (p[1] as f32 - cy) * scale);
+
+        let painter = painter.with_clip_rect(rect);
+        if links_on && n <= 30_000 {
+            let pos: std::collections::HashMap<u64, egui::Pos2> = pts.iter().map(|(id, p, _)| (*id, to_screen(*p))).collect();
+            let stroke = egui::Stroke::new(0.6, egui::Color32::from_white_alpha(28));
+            for r in t.relations.iter().take(40_000) {
+                if let (Some(a), Some(b)) = (pos.get(&r.from), pos.get(&r.to)) {
+                    painter.line_segment([*a, *b], stroke);
+                }
+            }
+        }
+        let mut mesh = egui::Mesh::default();
+        let mut hovered: Option<(f32, u64)> = None;
+        let hover = resp.hover_pos();
+        for (id, p, th) in pts.iter().take(300_000) {
+            let c = to_screen(*p);
+            if !rect.expand(10.0).contains(c) {
+                continue;
+            }
+            let mut r = base;
+            if chosen[3].is_some() {
+                if let Some(v) = num(th, &chosen[3]) {
+                    r = base * (0.4 + 2.2 * if shi > slo { ((v - slo) / (shi - slo)) as f32 } else { 0.5 });
+                }
+            }
+            let r = r.max(0.8);
+            mesh.add_colored_rect(egui::Rect::from_center_size(c, egui::vec2(r * 2.0, r * 2.0)), color_of(th));
+            if let Some(hp) = hover {
+                let d = c.distance(hp);
+                if d < (r + 6.0) && hovered.is_none_or(|(bd, _)| d < bd) {
+                    hovered = Some((d, *id));
+                }
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        if resp.clicked() {
+            self.selected = hovered.map(|h| h.1);
+        }
+        if let Some(sel) = self.selected.and_then(|id| pts.iter().find(|p| p.0 == id)) {
+            painter.circle_stroke(to_screen(sel.1), base + 5.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+        }
+        let show = hovered.map(|h| h.1).or(self.selected);
+        if let Some(th) = show.and_then(|id| t.things.get(&id)) {
+            let props: Vec<String> = th
+                .props
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        Value::Number(n) => fmt(n.as_f64().unwrap_or(0.0)),
+                        other => other.to_string().trim_matches('"').to_string(),
+                    };
+                    format!("{k}={val}")
+                })
+                .collect();
+            painter.text(rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, format!("#{} {}   {}", th.id, th.kind, props.join("  ")), egui::FontId::monospace(12.0), egui::Color32::WHITE);
+        }
+        let legend = match &chosen[2] {
+            Some(p) if !discrete && hi > lo => format!("colour: {p}  {} → {}", fmt(lo), fmt(hi)),
+            Some(p) => format!("colour: {p}"),
+            None => "colour: kind".to_string(),
+        };
+        painter.text(rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · {legend} · scroll to zoom, drag to move"), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
+        self.pick = new_pick;
+        self.show_links = Some(links_on);
     }
 
     fn charts(&mut self, ui: &mut egui::Ui) {
@@ -615,6 +904,24 @@ const PALETTE: [egui::Color32; 6] = [
     egui::Color32::from_rgb(240, 220, 100),
     egui::Color32::from_rgb(170, 150, 255),
 ];
+
+fn hash_color(s: &str) -> egui::Color32 {
+    let h = s.bytes().fold(1469598103934665603u64, |a, b| (a ^ b as u64).wrapping_mul(1099511628211));
+    PALETTE[(h % PALETTE.len() as u64) as usize]
+}
+
+/// 0 = cold blue, 0.5 = yellow, 1 = hot red.
+fn heat_color(t: f64) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0) as f32;
+    let (r, g, b) = if t < 0.5 {
+        let u = t * 2.0;
+        (30.0 + 225.0 * u, 40.0 + 190.0 * u, 160.0 - 100.0 * u)
+    } else {
+        let u = (t - 0.5) * 2.0;
+        (255.0, 230.0 - 190.0 * u, 60.0 - 30.0 * u)
+    };
+    egui::Color32::from_rgb(r as u8, g as u8, b as u8)
+}
 
 fn fmt(v: f64) -> String {
     if v.abs() >= 1e6 || (v != 0.0 && v.abs() < 1e-3) {

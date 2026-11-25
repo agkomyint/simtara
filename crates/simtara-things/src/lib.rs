@@ -49,8 +49,21 @@ pub struct MetricDef {
     pub op: String,
 }
 
+/// How a picture of the universe should be drawn. A script sets it with `view{...}`; every field
+/// names a property of the things (x and y make a map, color and size make it readable).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct View {
+    pub x: Option<String>,
+    pub y: Option<String>,
+    pub color: Option<String>,
+    pub size: Option<String>,
+    pub links: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Things {
+    #[serde(default)]
+    pub view: View,
     next_id: u64,
     pub things: BTreeMap<u64, Thing>,
     pub relations: Vec<Relation>,
@@ -246,6 +259,12 @@ fn register_commands(w: &mut World) {
             .map(|r| json!({"id": r.to, "kind": r.kind, "weight": r.weight}))
             .collect();
         Ok(Value::Array(out))
+    });
+    w.register_command("view", |w, a| {
+        let text = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
+        let v = View { x: text("x"), y: text("y"), color: text("color"), size: text("size"), links: a.get("links").and_then(Value::as_bool).unwrap_or(false) };
+        things_mut(w)?.view = v;
+        Ok(json!(true))
     });
     w.register_command("define_metric", |w, a| {
         let name = str_arg(a, "name")?.to_string();
