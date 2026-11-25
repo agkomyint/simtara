@@ -10,5 +10,6 @@ simtara-core = { path = "../simtara-core" }
 simtara-particles = { path = "../simtara-particles" }
 simtara-orbits = { path = "../simtara-orbits" }
 simtara-script = { path = "../simtara-script" }
+simtara-things = { path = "../simtara-things" }
 serde.workspace = true
 serde_json.workspace = true

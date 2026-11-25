@@ -1,12 +1,14 @@
 //! SimTara Studio: launcher (new + saved universes) and a live universe with a control panel,
 //! saving, and experiments.
 
+mod build;
+
 use eframe::egui;
 use simtara_core::{Backend, Config, Simulation, Snapshot};
 use simtara_gpu::GpuModule;
 use simtara_particles::{simulation, Boundary, ParticleConfig, ParticleParams, Particles};
 use simtara_orbits::Bodies;
-use simtara_store::{Experiment, Store, UniverseMeta, TEMPLATE_ORBITS, TEMPLATE_PARTICLES};
+use simtara_store::{Experiment, Store, UniverseMeta, TEMPLATE_BUILD, TEMPLATE_ORBITS, TEMPLATE_PARTICLES};
 use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver};
 
@@ -36,6 +38,7 @@ struct Launch {
     spread: f32,
     base: f32,
     use_gpu: bool,
+    example: usize,
 }
 
 enum JobMsg {
@@ -81,6 +84,7 @@ struct Running {
 enum Screen {
     Launcher,
     Universe(Box<Running>),
+    Build(Box<build::BuildView>),
 }
 
 struct Studio {
@@ -549,10 +553,10 @@ impl Studio {
 
     /// Save the open universe if it has been saved before (used when leaving it).
     fn autosave(&mut self) {
-        if let Screen::Universe(run) = &mut self.screen {
-            if run.saved_as.is_some() {
-                run.save(&self.store);
-            }
+        match &mut self.screen {
+            Screen::Universe(run) if run.saved_as.is_some() => run.save(&self.store),
+            Screen::Build(b) if b.saved_as.is_some() => b.save(&self.store),
+            _ => {}
         }
     }
 }
@@ -617,9 +621,10 @@ impl eframe::App for Studio {
                         ui.add_space(8.0);
                         let cards = [
                             (TEMPLATE_PARTICLES, "Particle life", "Thousands of coloured particles that attract and repel. Watch life-like patterns appear. Runs on CPU or GPU."),
-                            (TEMPLATE_ORBITS, "Sun, Earth & Moon", "Real gravity with real masses and distances. Script events in Lua, like making the Moon vanish."),
+                            (TEMPLATE_ORBITS, "Sun, Earth & Moon", "Real gravity with real masses and distances. Script events in Luau, like making the Moon vanish."),
+                            (TEMPLATE_BUILD, "Build your own", "Anything: people, ideas, water, markets. Describe things and rules in a script and watch it run."),
                         ];
-                        ui.columns(2, |cols| {
+                        ui.columns(3, |cols| {
                             for (i, (id, title, text)) in cards.iter().enumerate() {
                                 let selected = self.launch.template == *id;
                                 let stroke = if selected { egui::Stroke::new(2.0, accent) } else { egui::Stroke::new(1.0, egui::Color32::from_gray(70)) };
@@ -645,10 +650,21 @@ impl eframe::App for Studio {
                         let l = &mut self.launch;
                         egui::Frame::group(ui.style()).inner_margin(14.0).show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            if l.template == TEMPLATE_ORBITS {
+                            if l.template == TEMPLATE_BUILD {
+                                ui.label("Start from an example, or an empty page. You write the universe as a script, with a live editor, charts, and every thing inspectable.");
+                                ui.add_space(6.0);
+                                for (i, (title, about, _)) in build::EXAMPLES.iter().enumerate() {
+                                    ui.radio_value(&mut l.example, i, format!("{title}  -  {about}"));
+                                }
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Seed");
+                                    ui.add(egui::DragValue::new(&mut l.seed));
+                                });
+                            } else if l.template == TEMPLATE_ORBITS {
                                 ui.label("Sun, Earth and Moon start in their real orbits. One tick is 6 hours, so 1461 ticks is one year.");
                                 ui.add_space(4.0);
-                                ui.weak("Once inside, write a Lua script and run an experiment to compare two versions.");
+                                ui.weak("Once inside, write a Luau script and run an experiment to compare two versions.");
                             } else {
                                 egui::Grid::new("launch").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
                                     ui.label("Particles");
@@ -690,17 +706,30 @@ impl eframe::App for Studio {
                     self.refresh();
                 }
                 if let Some(name) = open {
-                    match Running::open(&self.store, &name, GpuModule::new(), self.launch.use_gpu) {
-                        Ok(run) => {
+                    match open_screen(&self.store, &name, self.launch.use_gpu) {
+                        Ok(screen) => {
                             self.notice.clear();
-                            self.screen = Screen::Universe(Box::new(run));
+                            self.screen = screen;
                         }
                         Err(e) => self.notice = format!("could not open '{name}': {e}"),
                     }
                 } else if go {
                     self.notice.clear();
                     let name = self.store.suggest_name();
-                    self.screen = Screen::Universe(Box::new(Running::start(&self.launch, GpuModule::new(), name)));
+                    self.screen = if self.launch.template == TEMPLATE_BUILD {
+                        Screen::Build(Box::new(build::BuildView::new(self.launch.example, self.launch.seed, name)))
+                    } else {
+                        Screen::Universe(Box::new(Running::start(&self.launch, GpuModule::new(), name)))
+                    };
+                }
+            }
+            Screen::Build(b) => {
+                let back = b.show(ui, &self.store);
+                ui.ctx().request_repaint();
+                if back {
+                    self.autosave();
+                    self.screen = Screen::Launcher;
+                    self.refresh();
                 }
             }
             Screen::Universe(run) => {
@@ -981,6 +1010,16 @@ impl eframe::App for Studio {
     }
 }
 
+/// Open a saved universe on the screen that fits its template.
+fn open_screen(store: &Store, name: &str, use_gpu: bool) -> Result<Screen, String> {
+    let (_, snap) = store.load(name)?;
+    if simtara_store::template_of(&snap.config) == TEMPLATE_BUILD {
+        Ok(Screen::Build(Box::new(build::BuildView::open(store, name)?)))
+    } else {
+        Ok(Screen::Universe(Box::new(Running::open(store, name, GpuModule::new(), use_gpu)?)))
+    }
+}
+
 fn main() -> eframe::Result {
     let g = GpuModule::new();
     let store = Store::default_location();
@@ -990,13 +1029,13 @@ fn main() -> eframe::Result {
     let mut notice = String::new();
     let mut screen = Screen::Launcher;
     if let Some(name) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
-        match Running::open(&store, name, GpuModule::new(), g.available()) {
-            Ok(run) => screen = Screen::Universe(Box::new(run)),
+        match open_screen(&store, name, g.available()) {
+            Ok(s) => screen = s,
             Err(e) => notice = format!("could not open '{name}': {e}"),
         }
     }
     let studio = Studio {
-        launch: Launch { template: TEMPLATE_PARTICLES, count: 8000, kinds: 4, seed: 1, spread: 0.8, base: 0.0, use_gpu: g.available() },
+        launch: Launch { template: TEMPLATE_PARTICLES, count: 8000, kinds: 4, seed: 1, spread: 0.8, base: 0.0, use_gpu: g.available(), example: 1 },
         screen,
         gpu_desc: g.description(),
         gpu_ok: g.available(),

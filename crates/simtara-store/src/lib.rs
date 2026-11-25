@@ -25,6 +25,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TEMPLATE_PARTICLES: &str = "particles";
 pub const TEMPLATE_ORBITS: &str = "orbits";
+/// A universe described entirely by a script: things, relations and rules (plus orbits if the config asks).
+pub const TEMPLATE_BUILD: &str = "build";
 
 /// Parameters of the particles template that an experiment may change: (field, label).
 pub const PARAMETERS: [(&str, &str); 5] =
@@ -34,7 +36,9 @@ pub const DEFAULT_METRIC: &str = "particles.kinetic_energy";
 
 /// The metric an experiment charts unless told otherwise.
 pub fn default_metric(template: &str) -> &'static str {
-    if template == TEMPLATE_ORBITS {
+    if template == TEMPLATE_BUILD {
+        "things.total"
+    } else if template == TEMPLATE_ORBITS {
         "orbits.distance_km.Earth"
     } else {
         DEFAULT_METRIC
@@ -113,7 +117,9 @@ pub struct Experiment {
 
 /// Which template a config describes.
 pub fn template_of(config: &Config) -> &'static str {
-    if config.modules.contains_key(simtara_orbits::MODULE) {
+    if config.modules.contains_key(simtara_things::MODULE) {
+        TEMPLATE_BUILD
+    } else if config.modules.contains_key(simtara_orbits::MODULE) {
         TEMPLATE_ORBITS
     } else {
         TEMPLATE_PARTICLES
@@ -124,7 +130,13 @@ pub fn template_of(config: &Config) -> &'static str {
 /// clients may add more modules, such as the GPU backend).
 pub fn build_simulation(config: &Config) -> Simulation {
     let mut sim = Simulation::new(config.clone());
-    if template_of(config) == TEMPLATE_ORBITS {
+    if template_of(config) == TEMPLATE_BUILD {
+        sim.add_module(simtara_things::ThingsModule);
+        if config.modules.contains_key(simtara_orbits::MODULE) {
+            sim.add_module(simtara_orbits::OrbitModule);
+        }
+        sim.add_module(simtara_script::ScriptModule);
+    } else if template_of(config) == TEMPLATE_ORBITS {
         sim.add_module(simtara_orbits::OrbitModule);
         sim.add_module(simtara_script::ScriptModule);
     } else {
@@ -137,6 +149,14 @@ pub fn build_simulation(config: &Config) -> Simulation {
 pub fn new_orbits_config(seed: u64, script: &str) -> Config {
     let mut config = Config { seed, ..Config::default() };
     config.set_module(simtara_orbits::MODULE, &simtara_orbits::OrbitConfig::sun_earth_moon());
+    config.set_module(simtara_script::MODULE, &simtara_script::ScriptConfig { source: script.to_string() });
+    config
+}
+
+/// A new universe that exists only as a script (see `simtara-things`).
+pub fn new_build_config(seed: u64, script: &str) -> Config {
+    let mut config = Config { seed, ..Config::default() };
+    config.set_module(simtara_things::MODULE, &serde_json::json!({}));
     config.set_module(simtara_script::MODULE, &simtara_script::ScriptConfig { source: script.to_string() });
     config
 }
@@ -247,9 +267,10 @@ impl Store {
         let dir = self.dir(&name)?;
         let snap = sim.snapshot()?;
         let created = read_json::<UniverseMeta>(&dir.join("universe.json")).map(|m| m.created).unwrap_or_else(|_| now());
-        let summary = match sim.world().get::<simtara_orbits::Bodies>() {
-            Some(b) => format!("{} bodies", b.list.len()),
-            None => format!("{} particles", sim.world().get::<simtara_particles::Particles>().map_or(0, |p| p.len())),
+        let summary = match (sim.world().get::<simtara_things::Things>(), sim.world().get::<simtara_orbits::Bodies>()) {
+            (Some(t), _) => format!("{} things, {} rules", t.things.len(), t.rules.len()),
+            (None, Some(b)) => format!("{} bodies", b.list.len()),
+            (None, None) => format!("{} particles", sim.world().get::<simtara_particles::Particles>().map_or(0, |p| p.len())),
         };
         let meta = UniverseMeta {
             schema_version: SCHEMA_VERSION,

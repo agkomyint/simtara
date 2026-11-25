@@ -15,4 +15,6 @@ simtara-gpu = { path = "../simtara-gpu" }
 simtara-store = { path = "../simtara-store" }
 simtara-orbits = { path = "../simtara-orbits" }
 simtara-script = { path = "../simtara-script" }
+simtara-things = { path = "../simtara-things" }
+serde_json.workspace = true
 eframe = "0.37"
