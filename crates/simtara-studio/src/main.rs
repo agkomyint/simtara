@@ -2,6 +2,7 @@
 //! saving, and experiments.
 
 mod build;
+mod view3d;
 
 use eframe::egui;
 use simtara_core::{Backend, Config, Simulation, Snapshot};

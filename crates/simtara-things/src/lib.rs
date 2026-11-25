@@ -58,6 +58,50 @@ pub struct View {
     pub color: Option<String>,
     pub size: Option<String>,
     pub links: bool,
+    /// Property that gives each thing's height (3D) and the property naming each thing's shape.
+    #[serde(default)]
+    pub z: Option<String>,
+    #[serde(default)]
+    pub shape: Option<String>,
+    /// "2d" or "3d"; unset means 3D when `z` is set.
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// The camera of the universe's 3D picture. Saved with the universe, so a script can place it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Camera {
+    /// Degrees around the up axis (z) and above the horizon.
+    pub yaw: f64,
+    pub pitch: f64,
+    /// 1 = the whole universe just fits; smaller is closer.
+    pub distance: f64,
+    /// Field of view in degrees; 0 = no perspective (orthographic).
+    pub fov: f64,
+    /// Keep the camera centred on this thing (0 = the middle of the universe).
+    pub follow: u64,
+}
+
+impl Default for Camera {
+    fn default() -> Camera {
+        Camera { yaw: 40.0, pitch: 28.0, distance: 1.0, fov: 50.0, follow: 0 }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Light {
+    pub yaw: f64,
+    pub pitch: f64,
+    pub ambient: f64,
+    pub strength: f64,
+    pub ground: bool,
+    pub grid: bool,
+}
+
+impl Default for Light {
+    fn default() -> Light {
+        Light { yaw: 300.0, pitch: 55.0, ambient: 0.3, strength: 0.8, ground: true, grid: true }
+    }
 }
 
 /// A named number the person can turn while the universe runs. Rules read it like a property
@@ -85,6 +129,10 @@ impl Param {
 pub struct Things {
     #[serde(default)]
     pub view: View,
+    #[serde(default)]
+    pub camera: Camera,
+    #[serde(default)]
+    pub light: Light,
     #[serde(default)]
     pub params: BTreeMap<String, Param>,
     /// Values that win over what `param{...}` says (set by an experiment before the script's setup runs).
@@ -331,8 +379,31 @@ fn register_commands(w: &mut World) {
     });
     w.register_command("view", |w, a| {
         let text = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
-        let v = View { x: text("x"), y: text("y"), color: text("color"), size: text("size"), links: a.get("links").and_then(Value::as_bool).unwrap_or(false) };
+        let v = View { x: text("x"), y: text("y"), color: text("color"), size: text("size"), links: a.get("links").and_then(Value::as_bool).unwrap_or(false), z: text("z"), shape: text("shape"), mode: text("mode") };
         things_mut(w)?.view = v;
+        Ok(json!(true))
+    });
+    // camera{yaw=, pitch=, distance=, fov=, follow=}: only the fields given change
+    w.register_command("camera", |w, a| {
+        let c = &mut things_mut(w)?.camera;
+        let num = |k: &str| a.get(k).and_then(Value::as_f64);
+        if let Some(v) = num("yaw") { c.yaw = v; }
+        if let Some(v) = num("pitch") { c.pitch = v.clamp(-89.0, 89.0); }
+        if let Some(v) = num("distance") { c.distance = v.clamp(0.05, 50.0); }
+        if let Some(v) = num("fov") { c.fov = v.clamp(0.0, 120.0); }
+        if let Some(v) = num("follow") { c.follow = v.max(0.0) as u64; }
+        Ok(json!(true))
+    });
+    // light{yaw=, pitch=, ambient=, strength=, ground=, grid=}
+    w.register_command("light", |w, a| {
+        let l = &mut things_mut(w)?.light;
+        let num = |k: &str| a.get(k).and_then(Value::as_f64);
+        if let Some(v) = num("yaw") { l.yaw = v; }
+        if let Some(v) = num("pitch") { l.pitch = v.clamp(-89.0, 89.0); }
+        if let Some(v) = num("ambient") { l.ambient = v.clamp(0.0, 1.0); }
+        if let Some(v) = num("strength") { l.strength = v.clamp(0.0, 2.0); }
+        if let Some(v) = a.get("ground").and_then(Value::as_bool) { l.ground = v; }
+        if let Some(v) = a.get("grid").and_then(Value::as_bool) { l.grid = v; }
         Ok(json!(true))
     });
     w.register_command("define_metric", |w, a| {

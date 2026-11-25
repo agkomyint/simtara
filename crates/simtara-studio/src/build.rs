@@ -10,13 +10,15 @@ use simtara_core::{RunState, Simulation};
 use simtara_store::{Experiment, Store, TEMPLATE_BUILD};
 use std::sync::mpsc::{channel, Receiver};
 use simtara_things::Things;
+use crate::view3d;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXAMPLES: [(&str, &str, &str); 8] = [
+pub const EXAMPLES: [(&str, &str, &str); 9] = [
     ("Empty universe", "A blank page with a few hints. Describe what exists, then the rules.", EMPTY),
     ("An idea spreads", "1,500 people, 3 of them know an idea. Each tells friends. No physics at all.", IDEA),
     ("Forest fire (physics + chemistry)", "Fuel, heat and oxygen. Turn oxygen, rain and ignition temperature while it burns.", include_str!("../../../examples/fire.luau")),
     ("Chemical reaction patterns", "Two chemicals react and diffuse: spots, stripes and mazes grow. Turn feed and kill.", include_str!("../../../examples/reaction.luau")),
+    ("Bouncing things (3D)", "120 balls, cubes, pyramids and ships bouncing. Turn the camera and light, change gravity and wind, shake as a human.", include_str!("../../../examples/balls3d.luau")),
     ("Heat on a plate", "A 40x40 plate with a hot square in the middle. Heat spreads to neighbours. Watch the picture.", HEAT),
     ("Towns and a disease", "Four towns of people, mostly meeting their own town. Watch the disease jump between towns.", TOWNS),
     ("Typed (Luau types)", "The same crowd, written with Luau type annotations so mistakes are caught early.", TYPED),
@@ -175,7 +177,7 @@ end
 "##;
 
 /// (title, what it does, what to type)
-const REFERENCE: [(&str, &str, &str); 21] = [
+const REFERENCE: [(&str, &str, &str); 23] = [
     ("spawn", "Create a thing. Returns its id.", "local id = spawn{kind = \"person\", props = {age = 30, mood = \"calm\"}}"),
     ("despawn", "Remove a thing (and its relations).", "despawn(id)"),
     ("set", "Change properties of one thing.", "set{id = id, props = {age = 31}}"),
@@ -193,11 +195,16 @@ const REFERENCE: [(&str, &str, &str); 21] = [
     ("param", "A control you can turn while it runs. Rules use it by name like a property.", "param{name = \"spread\", value = 0.1, min = 0, max = 1, about = \"how contagious\"}"),
     ("owner", "Who may change a control. Add owner = \"nature\" (or \"cat,dog\") to param{}; Studio's Play as menu locks the others.", "param{name = \"rain\", value = 0, min = 0, max = 1, owner = \"nature\"}"),
     ("play_as", "Act as a role: only that role's controls can be changed. Empty = see and change all.", "play_as{role = \"firefighters\"}"),
+    ("camera", "Place the 3D camera (it belongs to the universe and is saved). distance 1 fits everything; fov 0 is flat; follow a thing by id.", "camera{yaw = 35, pitch = 25, distance = 0.9, fov = 50, follow = 0}"),
+    ("light", "Aim the 3D light. ambient is the light everywhere, strength the light from the lamp.", "light{yaw = 300, pitch = 55, ambient = 0.3, strength = 0.8, ground = true, grid = true}"),
     ("set_param", "Change a control from the script.", "set_param{name = \"spread\", value = 0.2}"),
     ("view", "How to draw things in the Universe tab. Each field names a property; links draws relations.", "view{x = \"x\", y = \"y\", color = \"heat\", size = \"mass\", links = true}"),
     ("random", "A repeatable random number 0..1 (never math.random).", "if random() < 0.5 then end"),
     ("log", "Print a line to the Messages box below the editor.", "log(\"tick\", t)"),
 ];
+
+/// A model that ships with SimTara; it is copied into a project's models/ folder when it is saved.
+const SHIP_OBJ: &str = include_str!("../../../examples/models/ship.obj");
 
 const DEFAULT_EXP_NAME: &str = "what if it were different";
 
@@ -234,7 +241,11 @@ pub struct BuildView {
     pan: egui::Vec2,
     zoom: f32,
     /// x, y, colour, size chosen in the picture (None = what the script said; empty = none)
-    pick: [Option<String>; 4],
+    pick: [Option<String>; 6],
+    mode3d: Option<bool>,
+    models: std::collections::HashMap<String, view3d::Mesh>,
+    models_for: Option<String>,
+    model_errors: Vec<String>,
     show_links: Option<bool>,
     selected: Option<u64>,
     exp_name: String,
@@ -283,6 +294,10 @@ impl BuildView {
             pan: egui::Vec2::ZERO,
             zoom: 1.0,
             pick: Default::default(),
+            mode3d: None,
+            models: std::collections::HashMap::new(),
+            models_for: None,
+            model_errors: Vec::new(),
             show_links: None,
             selected: None,
             kind_filter: String::new(),
@@ -323,7 +338,11 @@ impl BuildView {
             Ok(meta) => {
                 self.status = format!("saved '{}' at tick {}", meta.name, meta.tick);
                 self.name_input = meta.name.clone();
+                if self.script.contains("\"ship\"") {
+                    let _ = store.add_model_if_missing(&meta.name, "ship", SHIP_OBJ);
+                }
                 self.saved_as = Some(meta.name);
+                self.models.clear();
             }
             Err(e) => self.status = format!("could not save: {e}"),
         }
@@ -492,7 +511,10 @@ impl BuildView {
             });
             ui.separator();
             match self.tab {
-                Tab::World => self.world_view(ui),
+                Tab::World => {
+                    self.load_models(store);
+                    self.world_view(ui, store)
+                }
                 Tab::Charts => self.charts(ui),
                 Tab::Things => self.things(ui),
                 Tab::Rules => self.rules(ui),
@@ -505,7 +527,35 @@ impl BuildView {
     }
 
     /// A picture of the things: x and y place them, colour and size show a property.
-    fn world_view(&mut self, ui: &mut egui::Ui) {
+    /// (Re)read the project's `models/*.obj` the first time, or when asked.
+    fn load_models(&mut self, store: &Store) {
+        if self.models_for == self.saved_as && !self.models.is_empty() {
+            return;
+        }
+        self.models.clear();
+        self.model_errors.clear();
+        for n in ["cube", "pyramid"] {
+            if let Some(m) = view3d::builtin(n) {
+                self.models.insert(n.to_string(), m);
+            }
+        }
+        if let Ok(m) = view3d::parse_obj(SHIP_OBJ) {
+            self.models.insert("ship".into(), m);
+        }
+        if let Some(name) = &self.saved_as {
+            for (n, text) in store.load_models(name) {
+                match view3d::parse_obj(&text) {
+                    Ok(m) => {
+                        self.models.insert(n, m);
+                    }
+                    Err(e) => self.model_errors.push(format!("{n}.obj: {e}")),
+                }
+            }
+        }
+        self.models_for = self.saved_as.clone();
+    }
+
+    fn world_view(&mut self, ui: &mut egui::Ui, store: &Store) {
         let Some(t) = self.sim.world().get::<Things>() else {
             ui.weak("This universe has no things to draw.");
             return;
@@ -557,9 +607,9 @@ impl BuildView {
         for th in t.things.values().take(500) {
             props.extend(th.props.keys().map(String::as_str));
         }
-        let from_view = [t.view.x.clone(), t.view.y.clone(), t.view.color.clone(), t.view.size.clone()];
-        let mut chosen: [Option<String>; 4] = Default::default();
-        for i in 0..4 {
+        let from_view = [t.view.x.clone(), t.view.y.clone(), t.view.color.clone(), t.view.size.clone(), t.view.z.clone(), t.view.shape.clone()];
+        let mut chosen: [Option<String>; 6] = Default::default();
+        for i in 0..6 {
             chosen[i] = match &self.pick[i] {
                 Some(p) if p.is_empty() => None,
                 Some(p) => Some(p.clone()),
@@ -567,7 +617,7 @@ impl BuildView {
             };
         }
         // properties literally called x and y make a map without being asked
-        for (i, name) in [(0usize, "x"), (1, "y")] {
+        for (i, name) in [(0usize, "x"), (1, "y"), (4, "z")] {
             if chosen[i].is_none() && self.pick[i].is_none() && props.contains(name) {
                 chosen[i] = Some(name.to_string());
             }
@@ -575,7 +625,18 @@ impl BuildView {
         let mut links_on = self.show_links.unwrap_or(t.view.links);
         let mut new_pick = self.pick.clone();
         ui.horizontal_wrapped(|ui| {
-            for (i, label) in ["x", "y", "colour", "size"].iter().enumerate() {
+            let mut three = self.mode3d.unwrap_or(match t.view.mode.as_deref() {
+                Some("3d") => true,
+                Some(_) => false,
+                None => chosen[4].is_some(),
+            });
+            if ui.checkbox(&mut three, "3D").on_hover_text("Draw the universe in 3D: drag to turn the camera, scroll to move closer").changed() {
+                self.mode3d = Some(three);
+            }
+            for (i, label) in ["x", "y", "colour", "size", "z", "shape"].iter().enumerate() {
+                if (i >= 4) && !three {
+                    continue;
+                }
                 ui.label(*label);
                 let none_label = if i < 2 { "grid layout" } else { "none" };
                 egui::ComboBox::from_id_salt(("pick", i)).width(90.0).selected_text(chosen[i].clone().unwrap_or_else(|| none_label.to_string())).show_ui(ui, |ui| {
@@ -595,7 +656,7 @@ impl BuildView {
                 self.zoom = 1.0;
             }
         });
-        for i in 0..4 {
+        for i in 0..6 {
             if new_pick[i] != self.pick[i] {
                 chosen[i] = new_pick[i].clone().filter(|s| !s.is_empty());
             }
@@ -666,6 +727,106 @@ impl BuildView {
         };
         let base = if n > 50_000 { 1.2 } else if n > 5_000 { 2.0 } else if n > 800 { 3.0 } else { 5.0 };
 
+        let three = self.mode3d.unwrap_or(match t.view.mode.as_deref() {
+            Some("3d") => true,
+            Some(_) => false,
+            None => chosen[4].is_some(),
+        });
+        if three {
+            let mut cam = t.camera.clone();
+            let mut light = t.light.clone();
+            let (cam0, light0) = (cam.clone(), light.clone());
+            ui.horizontal_wrapped(|ui| {
+                ui.label("camera");
+                ui.add(egui::Slider::new(&mut cam.yaw, -360.0..=360.0).text("turn"));
+                ui.add(egui::Slider::new(&mut cam.pitch, -89.0..=89.0).text("tilt"));
+                ui.add(egui::Slider::new(&mut cam.distance, 0.05..=5.0).logarithmic(true).text("distance"));
+                ui.add(egui::Slider::new(&mut cam.fov, 0.0..=120.0).text("lens").custom_formatter(|n, _| if n < 1.0 { "flat".into() } else { format!("{n:.0}°") }));
+                if let Some(id) = self.selected {
+                    if ui.selectable_label(cam.follow == id, format!("follow #{id}")).clicked() {
+                        cam.follow = if cam.follow == id { 0 } else { id };
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("light");
+                ui.add(egui::Slider::new(&mut light.yaw, 0.0..=360.0).text("direction"));
+                ui.add(egui::Slider::new(&mut light.pitch, 0.0..=90.0).text("height"));
+                ui.add(egui::Slider::new(&mut light.ambient, 0.0..=1.0).text("ambient"));
+                ui.add(egui::Slider::new(&mut light.strength, 0.0..=1.5).text("strength"));
+                ui.checkbox(&mut light.ground, "ground");
+                ui.checkbox(&mut light.grid, "grid");
+                if let Some(name) = self.saved_as.clone() {
+                    if ui.small_button("📁 models").on_hover_text("Open this project's models folder; drop .obj files there, then reload").clicked() {
+                        if let Ok(d) = store.models_dir(&name) {
+                            let _ = std::fs::create_dir_all(&d);
+                            let _ = std::process::Command::new("explorer").arg(d).spawn();
+                        }
+                    }
+                    if ui.small_button("⟳ reload models").clicked() {
+                        self.models.clear();
+                    }
+                }
+            });
+            for e in &self.model_errors {
+                ui.colored_label(egui::Color32::LIGHT_RED, e);
+            }
+            let items: Vec<view3d::Item> = pts
+                .iter()
+                .map(|(id, p, th)| {
+                    let z = num(th, &chosen[4]).unwrap_or(0.0);
+                    let sz = match num(th, &chosen[3]) {
+                        Some(v) if shi > slo => (0.4 + 2.2 * (v - slo) / (shi - slo)) as f32,
+                        _ => 1.0,
+                    };
+                    let shape = match th.props.get(chosen[5].as_deref().unwrap_or("shape")) {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    let heading = th.props.get("heading").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    view3d::Item { id: *id, pos: [p[0] as f32, p[1] as f32, z as f32], color: color_of(th), size: sz, heading, shape }
+                })
+                .collect();
+            let size = ui.available_size_before_wrap();
+            let (resp, _) = ui.allocate_painter(egui::vec2(size.x, (size.y - 10.0).max(200.0)), egui::Sense::click_and_drag());
+            let out = view3d::draw(ui, resp.rect, &resp, &items, &mut cam, &light, &self.models, self.selected);
+            if resp.clicked() {
+                self.selected = out.hovered;
+            }
+            let painter = ui.painter_at(resp.rect);
+            if let Some(at) = out.selected_at {
+                painter.circle_stroke(at, 9.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+            }
+            if let Some(th) = out.hovered.or(self.selected).and_then(|id| t.things.get(&id)) {
+                let props: Vec<String> = th
+                    .props
+                    .iter()
+                    .map(|(k, v)| match v {
+                        Value::Number(n) => format!("{k}={}", fmt(n.as_f64().unwrap_or(0.0))),
+                        other => format!("{k}={}", other.to_string().trim_matches('"')),
+                    })
+                    .collect();
+                painter.text(resp.rect.left_bottom() + egui::vec2(80.0, -8.0), egui::Align2::LEFT_BOTTOM, format!("#{} {}   {}", th.id, th.kind, props.join("  ")), egui::FontId::monospace(12.0), egui::Color32::WHITE);
+            }
+            painter.text(resp.rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · 3D · drag to turn, scroll to zoom"), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
+            self.pick = new_pick;
+            self.show_links = Some(links_on);
+            let cam_changed = (cam.yaw, cam.pitch, cam.distance, cam.fov, cam.follow) != (cam0.yaw, cam0.pitch, cam0.distance, cam0.fov, cam0.follow);
+            let light_changed = (light.yaw, light.pitch, light.ambient, light.strength, light.ground, light.grid) != (light0.yaw, light0.pitch, light0.ambient, light0.strength, light0.ground, light0.grid);
+            if let Some(r) = role_edit {
+                let _ = self.sim.world_mut().call("play_as", &json!({"role": r}));
+            }
+            for (name, value) in param_edits {
+                let _ = self.sim.world_mut().call("set_param", &json!({"name": name, "value": value}));
+            }
+            if cam_changed {
+                let _ = self.sim.world_mut().call("camera", &json!({"yaw": cam.yaw, "pitch": cam.pitch, "distance": cam.distance, "fov": cam.fov, "follow": cam.follow}));
+            }
+            if light_changed {
+                let _ = self.sim.world_mut().call("light", &json!({"yaw": light.yaw, "pitch": light.pitch, "ambient": light.ambient, "strength": light.strength, "ground": light.ground, "grid": light.grid}));
+            }
+            return;
+        }
         let size = ui.available_size_before_wrap();
         let (resp, painter) = ui.allocate_painter(egui::vec2(size.x, (size.y - 10.0).max(200.0)), egui::Sense::click_and_drag());
         let rect = resp.rect;

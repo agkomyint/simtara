@@ -258,6 +258,41 @@ impl Store {
         Ok(self.universes_dir().join(clean_name(name)?))
     }
 
+    /// The folder of one project: its state, `script.luau`, `models/` and `experiments/`.
+    pub fn project_dir(&self, name: &str) -> Result<PathBuf, String> {
+        self.dir(name)
+    }
+
+    /// Where a project keeps its 3D models (`.obj` files).
+    pub fn models_dir(&self, name: &str) -> Result<PathBuf, String> {
+        Ok(self.dir(name)?.join("models"))
+    }
+
+    /// Read every `.obj` in the project's models folder: (model name, file text).
+    pub fn load_models(&self, name: &str) -> Vec<(String, String)> {
+        let Ok(dir) = self.models_dir(name) else { return Vec::new() };
+        let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("obj")))
+            .filter_map(|e| Some((e.path().file_stem()?.to_string_lossy().to_string(), std::fs::read_to_string(e.path()).ok()?)))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Put a model into the project's models folder (does not overwrite one that is already there).
+    pub fn add_model_if_missing(&self, name: &str, model: &str, obj: &str) -> Result<(), String> {
+        let dir = self.models_dir(name)?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{}.obj", clean_name(model)?));
+        if !path.exists() {
+            std::fs::write(&path, obj).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn exists(&self, name: &str) -> bool {
         self.dir(name).map(|d| d.join("universe.json").is_file()).unwrap_or(false)
     }
@@ -291,6 +326,11 @@ impl Store {
         let text = serde_json::to_vec(&snap).map_err(|e| e.to_string())?;
         write_atomic(&dir.join("state.snap.json"), &text)?;
         write_json(&dir.join("universe.json"), &meta)?;
+        // A script universe is also a plain folder you (or a coding agent) can edit: script.luau + models/.
+        if template == TEMPLATE_BUILD {
+            write_atomic(&dir.join("script.luau"), simtara_script::source(sim.world()).as_bytes())?;
+            let _ = std::fs::create_dir_all(dir.join("models"));
+        }
         Ok(meta)
     }
 

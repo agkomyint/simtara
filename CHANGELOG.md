@@ -2,6 +2,9 @@
 
 - Controls: `param{name,value,min,max,about}` in a script shows as a slider (Universe tab) and can be changed live; rules read it by name. Experiments can change controls for the second run without editing code.
 - New examples: forest fire (physics + chemistry), reaction-diffusion patterns.
+- Roles: controls have `owner`s; "Play as" locks everything but your role's controls, and experiments respect it.
+- Shared limits: `gsum/gcount/gmean/gmax/gmin(kind, prop)` read whole-universe totals in rules, so water and money can run out.
+- **3D view.** Tick "3D" in the Universe tab: orbit camera (drag, scroll, follow a thing), a light, ground and grid, and shapes per thing (sphere, cube, pyramid, or any `.obj`). The camera and light belong to the universe (`camera{}`, `light{}`) and are saved. A saved universe is a project folder with `script.luau` and a `models/` folder for your `.obj` files. New example: Bouncing things (3D).
 
 ## Unreleased
 
