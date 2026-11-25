@@ -12,9 +12,11 @@ use std::sync::mpsc::{channel, Receiver};
 use simtara_things::Things;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXAMPLES: [(&str, &str, &str); 6] = [
+pub const EXAMPLES: [(&str, &str, &str); 8] = [
     ("Empty universe", "A blank page with a few hints. Describe what exists, then the rules.", EMPTY),
     ("An idea spreads", "1,500 people, 3 of them know an idea. Each tells friends. No physics at all.", IDEA),
+    ("Forest fire (physics + chemistry)", "Fuel, heat and oxygen. Turn oxygen, rain and ignition temperature while it burns.", include_str!("../../../examples/fire.luau")),
+    ("Chemical reaction patterns", "Two chemicals react and diffuse: spots, stripes and mazes grow. Turn feed and kill.", include_str!("../../../examples/reaction.luau")),
     ("Heat on a plate", "A 40x40 plate with a hot square in the middle. Heat spreads to neighbours. Watch the picture.", HEAT),
     ("Towns and a disease", "Four towns of people, mostly meeting their own town. Watch the disease jump between towns.", TOWNS),
     ("Typed (Luau types)", "The same crowd, written with Luau type annotations so mistakes are caught early.", TYPED),
@@ -173,7 +175,7 @@ end
 "##;
 
 /// (title, what it does, what to type)
-const REFERENCE: [(&str, &str, &str); 17] = [
+const REFERENCE: [(&str, &str, &str); 19] = [
     ("spawn", "Create a thing. Returns its id.", "local id = spawn{kind = \"person\", props = {age = 30, mood = \"calm\"}}"),
     ("despawn", "Remove a thing (and its relations).", "despawn(id)"),
     ("set", "Change properties of one thing.", "set{id = id, props = {age = 31}}"),
@@ -188,10 +190,14 @@ const REFERENCE: [(&str, &str, &str); 17] = [
     ("add_rule", "A formula run natively on every thing of a kind, each tick. Fast for huge crowds.", "add_rule{name = \"age\", kind = \"person\", set = {age = \"age + 1\"}, remove_when = \"age > 90\"}"),
     ("rule formulas", "Numbers, + - * / %, == != < > <= >=, and or not, if(c,a,b), min max abs sqrt floor clamp, random(), tick(), id, kind.", "when = \"energy < 1 and random() < 0.1\""),
     ("neighbours", "ncount(rel[,prop]) nsum nmean nmax nmin wsum wmean over the things this one points at.", "when = \"ncount(friend, knows) > 2\""),
+    ("param", "A control you can turn while it runs. Rules use it by name like a property.", "param{name = \"spread\", value = 0.1, min = 0, max = 1, about = \"how contagious\"}"),
+    ("set_param", "Change a control from the script.", "set_param{name = \"spread\", value = 0.2}"),
     ("view", "How to draw things in the Universe tab. Each field names a property; links draws relations.", "view{x = \"x\", y = \"y\", color = \"heat\", size = \"mass\", links = true}"),
     ("random", "A repeatable random number 0..1 (never math.random).", "if random() < 0.5 then end"),
     ("log", "Print a line to the Messages box below the editor.", "log(\"tick\", t)"),
 ];
+
+const DEFAULT_EXP_NAME: &str = "what if it were different";
 
 const KEYWORDS: [&str; 22] = [
     "function", "end", "if", "then", "else", "elseif", "for", "while", "do", "in", "return", "local", "and", "or", "not", "true", "false", "nil", "repeat", "until", "break", "continue",
@@ -233,6 +239,8 @@ pub struct BuildView {
     exp_script: String,
     exp_metric: String,
     exp_ticks: u64,
+    /// controls changed in the second run: name -> new value
+    exp_overrides: BTreeMap<String, f64>,
     experiments: Vec<Experiment>,
     exp_sel: Option<usize>,
     exp_live: Option<Experiment>,
@@ -277,10 +285,11 @@ impl BuildView {
             last_tick: None,
             ms: 0.0,
             commands,
-            exp_name: "what if it were different".into(),
+            exp_name: DEFAULT_EXP_NAME.into(),
             exp_script: String::new(),
             exp_metric: String::new(),
             exp_ticks: 300,
+            exp_overrides: BTreeMap::new(),
             experiments: Vec::new(),
             exp_sel: None,
             exp_live: None,
@@ -497,6 +506,22 @@ impl BuildView {
             ui.weak("Nothing exists yet. Create things with spawn{...} in setup().");
             return;
         }
+        let mut param_edits: Vec<(String, f64)> = Vec::new();
+        if !t.params.is_empty() {
+            egui::CollapsingHeader::new(format!("🎛 Controls ({})", t.params.len())).default_open(true).show(ui, |ui| {
+                egui::Grid::new("controls").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                    for (name, p) in &t.params {
+                        let mut v = p.value;
+                        ui.label(name).on_hover_text(&p.about);
+                        let step = (p.max - p.min) / 400.0;
+                        if ui.add(egui::Slider::new(&mut v, p.min..=p.max).step_by(step).custom_formatter(|n, _| fmt(n)).text(&p.about)).changed() {
+                            param_edits.push((name.clone(), v));
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        }
         let mut props: BTreeSet<&str> = BTreeSet::new();
         for th in t.things.values().take(500) {
             props.extend(th.props.keys().map(String::as_str));
@@ -697,6 +722,9 @@ impl BuildView {
         painter.text(rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · {legend} · scroll to zoom, drag to move"), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
         self.pick = new_pick;
         self.show_links = Some(links_on);
+        for (name, value) in param_edits {
+            let _ = self.sim.world_mut().call("set_param", &json!({"name": name, "value": value}));
+        }
     }
 
     fn charts(&mut self, ui: &mut egui::Ui) {
@@ -894,7 +922,15 @@ impl BuildView {
         let Some(name) = self.saved_as.clone() else { return };
         let made = (|| -> Result<_, String> {
             let id = store.next_experiment_id(&name)?;
-            let spec = simtara_store::new_script_spec(id, &self.exp_name, &self.exp_script, &self.exp_metric, self.exp_ticks);
+            let mut spec = simtara_store::new_script_spec(id, &self.exp_name, &self.exp_script, &self.exp_metric, self.exp_ticks);
+            spec.param_overrides = self.exp_overrides.clone();
+            if self.exp_name == DEFAULT_EXP_NAME && !self.exp_overrides.is_empty() {
+                let list: Vec<String> = self.exp_overrides.iter().map(|(k, v)| format!("{k} = {}", fmt(*v))).collect();
+                spec.name = list.join(", ");
+            }
+            if self.exp_overrides.is_empty() && self.exp_script == self.script {
+                return Err("nothing is different yet: change a control below or edit the changed script".into());
+            }
             Ok((spec, self.sim.snapshot()?))
         })();
         match made {
@@ -990,6 +1026,37 @@ impl BuildView {
                 ui.spinner();
             }
         });
+        let params: Vec<(String, simtara_things::Param)> = self.sim.world().get::<Things>().map(|t| t.params.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+        if params.is_empty() {
+            ui.weak("Tip: declare controls in your script with param{name = \"spread\", value = 0.1, min = 0, max = 1}. They appear here (and in the Universe tab) as sliders, and you can compare different values without editing code.");
+        } else {
+            ui.add_space(4.0);
+            ui.strong("Change a control for the second run");
+            ui.weak("Tick the controls that should be different. The first run uses the script's own values.");
+            egui::Grid::new("exp_params").num_columns(3).spacing([14.0, 4.0]).show(ui, |ui| {
+                for (name, p) in &params {
+                    let mut on = self.exp_overrides.contains_key(name);
+                    if ui.checkbox(&mut on, name).on_hover_text(&p.about).changed() {
+                        if on {
+                            self.exp_overrides.insert(name.clone(), p.value);
+                        } else {
+                            self.exp_overrides.remove(name);
+                        }
+                    }
+                    ui.weak(&p.about);
+                    match self.exp_overrides.get_mut(name) {
+                        Some(v) => {
+                            ui.add(egui::Slider::new(v, p.min..=p.max).step_by((p.max - p.min) / 400.0).custom_formatter(|n, _| fmt(n)));
+                        }
+                        None => {
+                            ui.weak(format!("{}", fmt(p.value)));
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(4.0);
+        }
         egui::CollapsingHeader::new("changed script (edit what is different)").default_open(false).show(ui, |ui| {
             let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
                 let job = highlight(text.as_str());

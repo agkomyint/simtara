@@ -421,7 +421,10 @@ fn eval(e: &Expr, me: &Thing, env: &mut Env) -> Val {
     match e {
         Expr::Num(n) => Val::N(*n),
         Expr::Str(s) => Val::S(s.clone()),
-        Expr::Prop(p) => prop(me, p),
+        Expr::Prop(p) => match env.things.params.get(p.as_str()) {
+            Some(par) if !me.props.contains_key(p.as_str()) && p != "id" && p != "kind" => Val::N(par.value),
+            _ => prop(me, p),
+        },
         Expr::Neg(x) => Val::N(-eval(x, me, env).num()),
         Expr::Not(x) => Val::N(!truthy(&eval(x, me, env)) as u8 as f64),
         Expr::Bin(Op::And, a, b) => Val::N((truthy(&eval(a, me, env)) && truthy(&eval(b, me, env))) as u8 as f64),
@@ -620,6 +623,7 @@ impl Things {
         for r in &self.rules {
             known.extend(r.set.keys().map(String::as_str));
         }
+        known.extend(self.params.keys().map(String::as_str));
         let mut out = Vec::new();
         for r in &self.rules {
             let Ok(c) = compile(r) else { continue };

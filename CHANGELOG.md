@@ -1,5 +1,8 @@
 # Changelog
 
+- Controls: `param{name,value,min,max,about}` in a script shows as a slider (Universe tab) and can be changed live; rules read it by name. Experiments can change controls for the second run without editing code.
+- New examples: forest fire (physics + chemistry), reaction-diffusion patterns.
+
 ## Unreleased
 
 - **Build screen in Studio.** "Build your own" template: Luau editor (colours, line numbers, errors at the line), live charts of your own measurements, a table of every thing with editable values, a rules panel (toggle, errors, typo warnings), a command reference with Insert buttons, examples (empty, idea spreads, typed Luau, epidemic), and a **Build & test** tab with checks like `people who know > 100`.

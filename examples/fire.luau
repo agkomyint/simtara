@@ -1,0 +1,51 @@
+-- A forest fire, from physics and chemistry.
+--   Combustion needs three things: fuel, heat above the ignition temperature, and oxygen.
+--   Burning uses up fuel and releases heat. Heat conducts to neighbours and leaks to the air.
+-- Turn the Controls while it runs: oxygen to 0 smothers the fire, rain cools and wets it,
+-- a low ignition temperature makes the forest explosive.
+local N = 60
+
+function setup()
+  param{name = "ignite_temp", value = 180, min = 100, max = 600, about = "temperature where fuel starts to burn"}
+  param{name = "heat_release", value = 150, min = 0, max = 400, about = "heat given out per burning cell per tick"}
+  param{name = "burn_rate", value = 0.05, min = 0.005, max = 0.3, about = "fuel burnt per tick"}
+  param{name = "oxygen", value = 1.0, min = 0, max = 1, about = "0 = no air, nothing burns"}
+  param{name = "conduction", value = 0.25, min = 0, max = 0.5, about = "how fast heat moves to neighbours"}
+  param{name = "air_cooling", value = 0.03, min = 0, max = 0.3, about = "heat lost to the air"}
+  param{name = "rain", value = 0, min = 0, max = 1, about = "cools cells and puts fires out"}
+  param{name = "ambient", value = 20, min = 0, max = 40, about = "air temperature"}
+
+  local id = {}
+  for gy = 0, N - 1 do
+    for gx = 0, N - 1 do
+      local river = (gx >= 28 and gx <= 30) and gy > 10
+      local fuel = river and 0 or (0.5 + random() * 0.5)
+      local spark = (gx - 12) ^ 2 + (gy - 30) ^ 2 < 4
+      id[gy * N + gx] = spawn{kind = "cell", props = {x = gx, y = gy, fuel = fuel, temp = spark and 600 or 20, burning = 0}}
+    end
+  end
+  for gy = 0, N - 1 do
+    for gx = 0, N - 1 do
+      local me = id[gy * N + gx]
+      if gx > 0 then relate{from = me, to = id[gy * N + gx - 1], kind = "next"} end
+      if gx < N - 1 then relate{from = me, to = id[gy * N + gx + 1], kind = "next"} end
+      if gy > 0 then relate{from = me, to = id[(gy - 1) * N + gx], kind = "next"} end
+      if gy < N - 1 then relate{from = me, to = id[(gy + 1) * N + gx], kind = "next"} end
+    end
+  end
+
+  -- chemistry: a cell burns while it has fuel, enough heat, and air
+  add_rule{name = "ignite", kind = "cell", set = {burning = "if(fuel > 0.02 and temp > ignite_temp and oxygen > 0.05 and rain < 0.8, 1, 0)"}}
+  -- burning consumes fuel (faster with more oxygen) and releases heat
+  add_rule{name = "combust", kind = "cell", set = {
+    fuel = "max(0, fuel - burning * burn_rate * oxygen)",
+    temp = "temp + burning * heat_release * oxygen"}}
+  -- physics: conduction to neighbours, cooling to the air, rain
+  add_rule{name = "heat_flow", kind = "cell", set = {
+    temp = "max(ambient, temp + conduction * (nmean(next, temp) - temp) - air_cooling * (temp - ambient) - rain * 0.15 * (temp - ambient))"}}
+
+  define_metric{name = "cells burning", kind = "cell", prop = "burning", op = "sum"}
+  define_metric{name = "fuel left", kind = "cell", prop = "fuel", op = "sum"}
+  define_metric{name = "hottest cell", kind = "cell", prop = "temp", op = "max"}
+  view{x = "x", y = "y", color = "temp", size = "fuel"}
+end

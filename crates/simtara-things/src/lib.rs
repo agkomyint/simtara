@@ -60,10 +60,26 @@ pub struct View {
     pub links: bool,
 }
 
+/// A named number the person can turn while the universe runs. Rules read it like a property
+/// (a thing's own property of the same name wins).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Param {
+    pub value: f64,
+    pub min: f64,
+    pub max: f64,
+    #[serde(default)]
+    pub about: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Things {
     #[serde(default)]
     pub view: View,
+    #[serde(default)]
+    pub params: BTreeMap<String, Param>,
+    /// Values that win over what `param{...}` says (set by an experiment before the script's setup runs).
+    #[serde(default)]
+    pub overrides: BTreeMap<String, f64>,
     next_id: u64,
     pub things: BTreeMap<u64, Thing>,
     pub relations: Vec<Relation>,
@@ -259,6 +275,28 @@ fn register_commands(w: &mut World) {
             .map(|r| json!({"id": r.to, "kind": r.kind, "weight": r.weight}))
             .collect();
         Ok(Value::Array(out))
+    });
+    w.register_command("param", |w, a| {
+        let name = str_arg(a, "name")?.to_string();
+        let value = a.get("value").and_then(Value::as_f64).ok_or("param needs a number: param{name = \"x\", value = 1, min = 0, max = 2}")?;
+        let min = a.get("min").and_then(Value::as_f64).unwrap_or(0f64.min(value));
+        let max = a.get("max").and_then(Value::as_f64).unwrap_or(if value > 0.0 { value * 2.0 } else { 1.0 });
+        let about = a.get("about").and_then(Value::as_str).unwrap_or("").to_string();
+        let t = things_mut(w)?;
+        let value = t.overrides.get(&name).copied().unwrap_or(value);
+        t.params.insert(name, Param { value, min: min.min(value), max: max.max(value), about });
+        Ok(json!(true))
+    });
+    w.register_command("set_param", |w, a| {
+        let name = str_arg(a, "name")?;
+        let value = a.get("value").and_then(Value::as_f64).ok_or("set_param needs a number value")?;
+        let p = things_mut(w)?.params.get_mut(name).ok_or_else(|| format!("no parameter named '{name}'; create it with param{{name=..., value=...}}"))?;
+        p.value = value;
+        Ok(json!(value))
+    });
+    w.register_command("get_param", |w, a| {
+        let name = str_arg(a, "name")?;
+        things_mut(w)?.params.get(name).map(|p| json!(p.value)).ok_or_else(|| format!("no parameter named '{name}'"))
     });
     w.register_command("view", |w, a| {
         let text = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
@@ -493,5 +531,21 @@ mod tests {
         assert!(warn[0].as_str().unwrap().contains("enrgy"), "{warn}");
         rule(w, json!({"name": "r", "kind": "p", "set": {"energy": "energy + 1"}})).unwrap();
         assert_eq!(w.call("warnings", &json!({})).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn parameters_can_be_turned_while_running_and_rules_read_them() {
+        let mut s = sim();
+        let w = s.world_mut();
+        w.call("spawn", &json!({"kind": "p", "props": {"v": 0.0}})).unwrap();
+        w.call("param", &json!({"name": "step", "value": 1.0, "min": 0, "max": 5})).unwrap();
+        rule(w, json!({"name": "go", "kind": "p", "set": {"v": "v + step"}})).unwrap();
+        assert_eq!(w.call("warnings", &json!({})).unwrap(), json!([]), "a parameter is a known name");
+        s.advance(3);
+        s.world_mut().call("set_param", &json!({"name": "step", "value": 10.0})).unwrap();
+        s.advance(2);
+        let v = s.world().get::<Things>().unwrap().things.values().next().unwrap().props["v"].as_f64().unwrap();
+        assert_eq!(v, 23.0);
+        assert!(s.world_mut().call("set_param", &json!({"name": "nope", "value": 1})).unwrap_err().contains("no parameter"));
     }
 }

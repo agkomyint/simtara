@@ -76,6 +76,9 @@ pub struct ExperimentSpec {
     /// If set, the "changed" run uses this Lua script instead of the universe's own.
     #[serde(default)]
     pub alt_script: Option<String>,
+    /// Controls (`param{...}`) set to different values in the changed run of a script universe.
+    #[serde(default)]
+    pub param_overrides: std::collections::BTreeMap<String, f64>,
     pub ticks: u64,
     pub sample_every: u64,
     pub metric: String,
@@ -395,7 +398,13 @@ fn arm_sim(start: &Snapshot, spec: &ExperimentSpec, value: f64, changed: bool) -
             (Some(alt), true) => alt.as_str(),
             _ => original.as_str(),
         };
-        return Ok(build_simulation(&new_build_config(start.config.seed, script)));
+        let mut sim = build_simulation(&new_build_config(start.config.seed, script));
+        if changed {
+            if let Some(t) = sim.world_mut().get_mut::<simtara_things::Things>() {
+                t.overrides = spec.param_overrides.clone();
+            }
+        }
+        return Ok(sim);
     }
     let mut sim = from_snapshot(start)?;
     // CPU on purpose: CPU runs repeat exactly, GPU runs are only approximately repeatable.
@@ -468,6 +477,7 @@ pub fn new_spec(id: String, sim: &Simulation, parameter: &str, alt_value: f64, t
         base_value,
         alt_value,
         alt_script: None,
+        param_overrides: Default::default(),
         ticks: ticks.max(1),
         sample_every: (ticks / 200).max(1),
         metric: DEFAULT_METRIC.to_string(),
@@ -485,6 +495,7 @@ pub fn new_script_spec(id: String, name: &str, script: &str, metric: &str, ticks
         base_value: 0.0,
         alt_value: 0.0,
         alt_script: Some(script.to_string()),
+        param_overrides: Default::default(),
         ticks: ticks.max(1),
         sample_every: (ticks / 200).max(1),
         metric: metric.to_string(),
@@ -720,6 +731,23 @@ pub fn run_script_report(script: &str, seed: u64, ticks: u64, expects: &[String]
 #[cfg(test)]
 mod build_experiment_tests {
     use super::*;
+
+    #[test]
+    fn a_control_can_be_changed_for_the_second_run_without_touching_the_script() {
+        let base = "function setup()
+  param{name = \"step\", value = 1, min = 0, max = 5}
+  spawn{kind = \"p\", props = {v = 0}}
+  add_rule{name = \"up\", kind = \"p\", set = {v = \"v + step\"}}
+  define_metric{name = \"v\", kind = \"p\", prop = \"v\", op = \"sum\"}
+end
+";
+        let start = build_simulation(&new_build_config(1, base)).snapshot().unwrap();
+        let mut spec = new_script_spec("e".into(), "step 3", base, "v", 10);
+        spec.param_overrides.insert("step".into(), 3.0);
+        let r = run_experiment(&start, &spec).unwrap();
+        assert_eq!(r.series[0].points.last().unwrap()[1], 10.0);
+        assert_eq!(r.series[1].points.last().unwrap()[1], 30.0);
+    }
 
     #[test]
     fn a_changed_script_is_compared_with_the_original_from_tick_zero() {
