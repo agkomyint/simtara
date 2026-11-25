@@ -387,6 +387,16 @@ pub fn get_parameter(sim: &Simulation, field: &str) -> Option<f64> {
 }
 
 fn arm_sim(start: &Snapshot, spec: &ExperimentSpec, value: f64, changed: bool) -> Result<Simulation, String> {
+    if template_of(&start.config) == TEMPLATE_BUILD {
+        // A script universe is described by its script, so both runs start again from tick 0 with
+        // the same seed: the original script, and the changed script.
+        let original = simtara_script::source(from_snapshot(start)?.world());
+        let script = match (&spec.alt_script, changed) {
+            (Some(alt), true) => alt.as_str(),
+            _ => original.as_str(),
+        };
+        return Ok(build_simulation(&new_build_config(start.config.seed, script)));
+    }
     let mut sim = from_snapshot(start)?;
     // CPU on purpose: CPU runs repeat exactly, GPU runs are only approximately repeatable.
     sim.compute_mut().set_requested(Backend::Cpu);
@@ -399,7 +409,13 @@ fn arm_sim(start: &Snapshot, spec: &ExperimentSpec, value: f64, changed: bool) -
 }
 
 fn sample(sim: &Simulation, metric: &str) -> Result<[f64; 2], String> {
-    let v = *sim.collect_metrics().get(metric).ok_or_else(|| format!("unknown metric '{metric}'"))?;
+    let m = sim.collect_metrics();
+    // A script universe defines its measurements in setup(), which runs on the first tick.
+    let v = match m.get(metric) {
+        Some(v) => *v,
+        None if sim.world().clock.tick == 0 && template_of(sim.config()) == TEMPLATE_BUILD => 0.0,
+        None => return Err(format!("unknown metric '{metric}'")),
+    };
     Ok([sim.world().clock.tick as f64, v])
 }
 
@@ -431,7 +447,7 @@ pub fn run_experiment_live(start: &Snapshot, spec: &ExperimentSpec, progress: &m
             engine_version: ENGINE_VERSION.to_string(),
             seed: start.config.seed,
             backend: "cpu".into(),
-            start_tick: start.tick,
+            start_tick: if template_of(&start.config) == TEMPLATE_BUILD { 0 } else { start.tick },
             millis: t0.elapsed().as_millis() as u64,
         },
     })
@@ -699,6 +715,30 @@ pub fn run_script_report(script: &str, seed: u64, ticks: u64, expects: &[String]
         "things": {"by_kind": kinds, "relations": relations},
         "rules": rules, "warnings": warnings, "checks": checks,
     })
+}
+
+#[cfg(test)]
+mod build_experiment_tests {
+    use super::*;
+
+    #[test]
+    fn a_changed_script_is_compared_with_the_original_from_tick_zero() {
+        let base = "function setup()
+  for i = 1, 10 do spawn{kind = \"p\", props = {v = 0}} end
+  add_rule{name = \"up\", kind = \"p\", set = {v = \"v + 1\"}}
+  define_metric{name = \"total\", kind = \"p\", prop = \"v\", op = \"sum\"}
+end
+";
+        let alt = base.replace("v + 1", "v + 2");
+        let mut sim = build_simulation(&new_build_config(3, base));
+        sim.advance(17); // the universe has already been running; the experiment still starts at 0
+        let start = sim.snapshot().unwrap();
+        let spec = new_script_spec("e1".into(), "faster", &alt, "total", 10);
+        let r = run_experiment(&start, &spec).unwrap();
+        assert_eq!(r.series[0].points.last().unwrap()[1], 100.0);
+        assert_eq!(r.series[1].points.last().unwrap()[1], 200.0);
+        assert_eq!(r.record.start_tick, 0);
+    }
 }
 
 #[cfg(test)]

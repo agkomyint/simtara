@@ -7,7 +7,8 @@
 use eframe::egui;
 use serde_json::{json, Value};
 use simtara_core::{RunState, Simulation};
-use simtara_store::{Store, TEMPLATE_BUILD};
+use simtara_store::{Experiment, Store, TEMPLATE_BUILD};
+use std::sync::mpsc::{channel, Receiver};
 use simtara_things::Things;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -203,6 +204,7 @@ enum Tab {
     Things,
     Rules,
     Test,
+    Experiment,
     Reference,
 }
 
@@ -227,6 +229,14 @@ pub struct BuildView {
     pick: [Option<String>; 4],
     show_links: Option<bool>,
     selected: Option<u64>,
+    exp_name: String,
+    exp_script: String,
+    exp_metric: String,
+    exp_ticks: u64,
+    experiments: Vec<Experiment>,
+    exp_sel: Option<usize>,
+    exp_live: Option<Experiment>,
+    exp_job: Option<Receiver<crate::JobMsg>>,
     test_ticks: u64,
     test_checks: String,
     report: Option<Value>,
@@ -267,6 +277,14 @@ impl BuildView {
             last_tick: None,
             ms: 0.0,
             commands,
+            exp_name: "what if it were different".into(),
+            exp_script: String::new(),
+            exp_metric: String::new(),
+            exp_ticks: 300,
+            experiments: Vec::new(),
+            exp_sel: None,
+            exp_live: None,
+            exp_job: None,
             test_ticks: 200,
             test_checks: "people who know > 10".into(),
             report: None,
@@ -281,6 +299,8 @@ impl BuildView {
         let script = simtara_script::source(sim.world());
         let mut v = BuildView::with(sim, snap.config.seed, script, meta.name.clone());
         v.saved_as = Some(meta.name.clone());
+        v.experiments = store.list_experiments(&meta.name);
+        v.exp_sel = v.experiments.len().checked_sub(1);
         v.status = format!("opened '{}' at tick {}", meta.name, meta.tick);
         Ok(v)
     }
@@ -340,6 +360,7 @@ impl BuildView {
         let mut back = false;
         let (mut run_start, mut run_live, mut do_save) = (false, false, false);
         let t0 = std::time::Instant::now();
+        self.poll_experiment(store);
         self.sim.run_frame();
         self.ms = t0.elapsed().as_secs_f32() * 1000.0;
         self.record();
@@ -448,7 +469,7 @@ impl BuildView {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                for (tab, label) in [(Tab::World, "🌍 Universe"), (Tab::Charts, "📈 Measurements"), (Tab::Things, "🧩 Things"), (Tab::Rules, "📏 Rules"), (Tab::Test, "✅ Test"), (Tab::Reference, "📖 Reference")] {
+                for (tab, label) in [(Tab::World, "🌍 Universe"), (Tab::Charts, "📈 Measurements"), (Tab::Things, "🧩 Things"), (Tab::Rules, "📏 Rules"), (Tab::Test, "✅ Test"), (Tab::Experiment, "🧪 Experiment"), (Tab::Reference, "📖 Reference")] {
                     ui.selectable_value(&mut self.tab, tab, label);
                 }
             });
@@ -459,6 +480,7 @@ impl BuildView {
                 Tab::Things => self.things(ui),
                 Tab::Rules => self.rules(ui),
                 Tab::Test => self.test(ui),
+                Tab::Experiment => self.experiment(ui, store),
                 Tab::Reference => self.reference(ui),
             }
         });
@@ -864,6 +886,138 @@ impl BuildView {
                 }
             }
         });
+    }
+
+    /// Start "original vs changed script", both from tick 0 with the same seed, on a background thread.
+    fn run_experiment(&mut self, store: &Store) {
+        self.save(store);
+        let Some(name) = self.saved_as.clone() else { return };
+        let made = (|| -> Result<_, String> {
+            let id = store.next_experiment_id(&name)?;
+            let spec = simtara_store::new_script_spec(id, &self.exp_name, &self.exp_script, &self.exp_metric, self.exp_ticks);
+            Ok((spec, self.sim.snapshot()?))
+        })();
+        match made {
+            Ok((spec, start)) => {
+                let live = Experiment {
+                    spec: spec.clone(),
+                    result: simtara_store::ExperimentResult {
+                        schema_version: 0,
+                        series: Vec::new(),
+                        record: simtara_store::RunRecord { engine_version: String::new(), seed: 0, backend: "cpu".into(), start_tick: 0, millis: 0 },
+                    },
+                };
+                let (tx, rx) = channel();
+                std::thread::spawn(move || {
+                    let txp = tx.clone();
+                    let out = simtara_store::run_experiment_live(&start, &spec, &mut |s| {
+                        let _ = txp.send(crate::JobMsg::Progress(s.to_vec()));
+                    })
+                    .map(|result| (Experiment { spec, result }, start));
+                    let _ = tx.send(crate::JobMsg::Done(out));
+                });
+                self.exp_live = Some(live);
+                self.exp_sel = None;
+                self.exp_job = Some(rx);
+                self.status = "experiment running...".into();
+            }
+            Err(e) => self.status = format!("could not start experiment: {e}"),
+        }
+    }
+
+    fn poll_experiment(&mut self, store: &Store) {
+        let Some(rx) = &self.exp_job else { return };
+        let mut finished = None;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                crate::JobMsg::Progress(series) => {
+                    if let Some(l) = self.exp_live.as_mut() {
+                        l.result.series = series;
+                    }
+                }
+                crate::JobMsg::Done(out) => {
+                    finished = Some(out);
+                    break;
+                }
+            }
+        }
+        let Some(out) = finished else { return };
+        self.exp_job = None;
+        self.exp_live = None;
+        match out {
+            Ok((exp, start)) => {
+                let name = self.saved_as.clone().unwrap_or_default();
+                self.status = match store.save_experiment(&name, &exp, &start) {
+                    Ok(()) => format!("experiment finished in {} ms and saved", exp.result.record.millis),
+                    Err(e) => format!("experiment finished but could not be saved: {e}"),
+                };
+                self.experiments.push(exp);
+                self.exp_sel = Some(self.experiments.len() - 1);
+            }
+            Err(e) => self.status = format!("experiment failed: {e}"),
+        }
+    }
+
+    fn experiment(&mut self, ui: &mut egui::Ui, store: &Store) {
+        if self.exp_script.is_empty() {
+            self.exp_script = self.script.clone();
+        }
+        if self.exp_metric.is_empty() {
+            self.exp_metric = self.history.keys().find(|k| !k.starts_with("things.")).cloned().unwrap_or_else(|| "things.total".into());
+        }
+        let running = self.exp_job.is_some();
+        ui.weak("Run your universe twice from tick 0 with the same seed: once as saved, once with the changed script below. Then compare one measurement.");
+        ui.horizontal(|ui| {
+            ui.label("name");
+            ui.add(egui::TextEdit::singleline(&mut self.exp_name).desired_width(220.0));
+            ui.label("measure");
+            egui::ComboBox::from_id_salt("exp_metric").selected_text(self.exp_metric.clone()).show_ui(ui, |ui| {
+                for k in self.history.keys() {
+                    ui.selectable_value(&mut self.exp_metric, k.clone(), k);
+                }
+            });
+            ui.label("ticks");
+            ui.add(egui::DragValue::new(&mut self.exp_ticks).range(1..=20000));
+        });
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!running, egui::Button::new("▶ Run experiment").fill(egui::Color32::from_rgb(40, 90, 160))).clicked() {
+                self.run_experiment(store);
+            }
+            if ui.button("copy current script").on_hover_text("Replace the changed script with what is in the editor").clicked() {
+                self.exp_script = self.script.clone();
+            }
+            if running {
+                ui.spinner();
+            }
+        });
+        egui::CollapsingHeader::new("changed script (edit what is different)").default_open(false).show(ui, |ui| {
+            let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
+                let job = highlight(text.as_str());
+                ui.fonts_mut(|f| f.layout_job(job))
+            };
+            egui::ScrollArea::vertical().max_height(260.0).id_salt("exp_script").show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut self.exp_script).font(egui::FontId::monospace(13.0)).code_editor().desired_width(f32::INFINITY).desired_rows(14).layouter(&mut layouter));
+            });
+        });
+        ui.separator();
+        if let Some(l) = &self.exp_live {
+            ui.strong(format!("Running: {}", l.spec.name));
+            if !l.result.series.is_empty() {
+                crate::draw_chart(ui, l);
+            }
+        } else if let Some(e) = self.exp_sel.and_then(|i| self.experiments.get(i)) {
+            ui.strong(format!("Experiment {} · {}", e.spec.id, e.spec.name));
+            crate::draw_chart(ui, e);
+        }
+        if !self.experiments.is_empty() {
+            ui.add_space(6.0);
+            ui.label("Past experiments");
+            for (i, e) in self.experiments.iter().enumerate() {
+                if ui.selectable_label(self.exp_sel == Some(i), format!("{} · {} · {}", e.spec.id, e.spec.name, e.spec.metric)).clicked() {
+                    self.exp_sel = Some(i);
+                }
+            }
+        }
     }
 
     fn reference(&mut self, ui: &mut egui::Ui) {
