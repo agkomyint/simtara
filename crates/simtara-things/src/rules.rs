@@ -16,7 +16,9 @@
 //! `random() tick() min(a,b) max(a,b) abs(x) sqrt(x) floor(x) clamp(x,lo,hi) if(cond,a,b)`.
 //! Neighbours (things this one points at with a relation): `ncount(rel)`, `ncount(rel, prop)`,
 //! `nsum(rel, prop)`, `nmean(rel, prop)`, `nmax(rel, prop)`, `nmin(rel, prop)`, `wsum(rel, prop)`
-//! (weighted by the relation's weight). `id` and `kind` are properties too.
+//! (weighted by the relation's weight). Whole universe, one kind, from before the rule ran:
+//! `gcount(kind)`, `gsum(kind, prop)`, `gmean(kind, prop)`, `gmax(kind, prop)`, `gmin(kind, prop)`
+//! (handy for shared limits like a water tank). `id` and `kind` are properties too.
 
 use crate::{Relation, Thing, Things};
 use rayon::prelude::*;
@@ -93,7 +95,33 @@ enum Expr {
     Call(&'static str, Vec<Expr>),
     /// Neighbour aggregate: function, relation kind, property.
     Agg(&'static str, String, Option<String>),
+    /// Whole-universe aggregate over one kind: function, kind, property. Read from before the rule ran.
+    Glob(&'static str, String, Option<String>),
 }
+
+const GLOBS: [&str; 5] = ["gcount", "gsum", "gmean", "gmax", "gmin"];
+
+type Globals = HashMap<(String, String, String), f64>;
+
+fn globals_in(e: &Expr, out: &mut Vec<(&'static str, String, Option<String>)>) {
+    match e {
+        Expr::Glob(f, k, p) => out.push((f, k.clone(), p.clone())),
+        Expr::Neg(a) | Expr::Not(a) => globals_in(a, out),
+        Expr::Bin(_, a, b) => {
+            globals_in(a, out);
+            globals_in(b, out);
+        }
+        Expr::Call(_, args) => args.iter().for_each(|a| globals_in(a, out)),
+        _ => {}
+    }
+}
+
+impl Compiled {
+    fn exprs(&self) -> impl Iterator<Item = &Expr> {
+        self.when.iter().chain(self.remove.iter()).chain(self.set.iter().map(|(_, e)| e))
+    }
+}
+
 
 /// A rule's formulas, parsed once.
 #[derive(Debug)]
@@ -317,6 +345,17 @@ impl Parser {
             }
             Tok::Id(name) if self.peek() == Some(&Tok::Sym("(")) => {
                 self.p += 1;
+                if let Some(g) = GLOBS.iter().find(|a| **a == name) {
+                    let kind = self.ident("a kind of thing, e.g. gsum(cell, water_used)")?;
+                    let prop = if self.eat_sym(",") { Some(self.ident("a property name")?) } else { None };
+                    if prop.is_none() && *g != "gcount" {
+                        return Err(format!("{g}(kind, property) needs a property"));
+                    }
+                    if !self.eat_sym(")") {
+                        return Err("missing ')'".into());
+                    }
+                    return Ok(Expr::Glob(g, kind, prop));
+                }
                 if let Some(agg) = AGGS.iter().find(|a| **a == name) {
                     let rel = self.ident("a relation name, e.g. ncount(knows)")?;
                     let prop = if self.eat_sym(",") { Some(self.ident("a property name")?) } else { None };
@@ -391,6 +430,7 @@ struct Env<'a> {
     index: &'a HashMap<u64, Vec<&'a Relation>>,
     tick: u64,
     rng: u64,
+    globals: &'a Globals,
 }
 
 fn splitmix(state: &mut u64) -> u64 {
@@ -470,6 +510,7 @@ fn eval(e: &Expr, me: &Thing, env: &mut Env) -> Val {
                 })
             }
         },
+        Expr::Glob(f, kind, p) => Val::N(env.globals.get(&(f.to_string(), kind.clone(), p.clone().unwrap_or_default())).copied().unwrap_or(0.0)),
         Expr::Agg(f, rel, p) => {
             let empty = Vec::new();
             let near = env.index.get(&me.id).unwrap_or(&empty);
@@ -501,7 +542,7 @@ type Outcome = Result<(Vec<(String, Value)>, bool), String>;
 
 fn eval_thing(c: &Compiled, t: &Thing, env: &Env) -> Outcome {
     // Each thing gets its own random stream, from the rule's seed and its id.
-    let mut e = Env { things: env.things, index: env.index, tick: env.tick, rng: env.rng ^ t.id.wrapping_mul(0x9E37_79B9_7F4A_7C15) };
+    let mut e = Env { things: env.things, index: env.index, tick: env.tick, globals: env.globals, rng: env.rng ^ t.id.wrapping_mul(0x9E37_79B9_7F4A_7C15) };
     if let Some(w) = &c.when {
         if !truthy(&eval(w, t, &mut e)) {
             return Ok((Vec::new(), false));
@@ -565,7 +606,22 @@ impl Things {
                         index.entry(r.from).or_default().push(r);
                     }
                 }
-                let env = Env { things: self, index: &index, tick, rng: seed };
+                let mut wanted = Vec::new();
+                compiled.exprs().for_each(|e| globals_in(e, &mut wanted));
+                let mut globals: Globals = HashMap::new();
+                for (f, kind, p) in wanted {
+                    let vals: Vec<f64> = self.of_kind(Some(&kind)).map(|t| p.as_ref().map_or(1.0, |p| prop(t, p).num())).collect();
+                    let n = vals.len() as f64;
+                    let v = match f {
+                        "gcount" => n,
+                        "gsum" => vals.iter().sum(),
+                        "gmean" => if n == 0.0 { 0.0 } else { vals.iter().sum::<f64>() / n },
+                        "gmax" => if n == 0.0 { 0.0 } else { vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max) },
+                        _ => if n == 0.0 { 0.0 } else { vals.iter().cloned().fold(f64::INFINITY, f64::min) },
+                    };
+                    globals.insert((f.to_string(), kind, p.unwrap_or_default()), v);
+                }
+                let env = Env { things: self, index: &index, tick, rng: seed, globals: &globals };
                 let targets: Vec<&Thing> = self.of_kind(Some(&rule.kind)).collect();
                 let run = |t: &&Thing| (t.id, eval_thing(&compiled, t, &env));
                 let outs: Vec<(u64, Outcome)> = if targets.len() >= PARALLEL_FROM { targets.par_iter().map(run).collect() } else { targets.iter().map(run).collect() };
@@ -611,6 +667,7 @@ fn reads(e: &Expr, out: &mut Vec<(String, bool)>) {
         }
         Expr::Call(_, args) => args.iter().for_each(|a| reads(a, out)),
         Expr::Agg(_, _, Some(p)) => out.push((p.clone(), true)),
+        Expr::Glob(_, _, Some(p)) => out.push((p.clone(), true)),
         _ => {}
     }
 }

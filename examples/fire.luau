@@ -18,6 +18,8 @@ function setup()
   param{name = "ambient", value = 20, min = 0, max = 40, about = "air temperature", owner = "nature"}
 
   -- what the fire crew can do: spray water on burning cells, and clear fuel next to the fire
+  param{name = "water_tank", value = 20000, min = 0, max = 100000, about = "total water available (it runs out)", owner = "command"}
+  param{name = "crew_budget", value = 60000, min = 0, max = 300000, about = "total money for crews (it runs out)", owner = "command"}
   param{name = "water_drop", value = 0, min = 0, max = 5, about = "water sprayed on burning cells (costs water)", owner = "firefighters"}
   param{name = "crews", value = 0, min = 0, max = 30, about = "ground crews cutting a firebreak (each costs 10 per tick)", owner = "firefighters"}
 
@@ -53,10 +55,10 @@ function setup()
 
   -- each crew gets to a few cells near the fire per tick, chance-based, so more crews = bigger firebreak
   add_rule{name = "water", kind = "cell", set = {
-    water_used = "water_used + water_drop * burning",
-    temp = "max(ambient, temp - water_drop * 25 * burning)"}}
-  add_rule{name = "clear", kind = "cell", set = {fuel = "if(temp > 60 and burning < 1 and random() < crews * 0.02, 0, fuel)"}}
-  add_rule{name = "pay", kind = "ops", set = {spent = "spent + crews * 10"}}
+    water_used = "water_used + if(gsum(cell, water_used) < water_tank, water_drop * burning, 0)",
+    temp = "max(ambient, temp - if(gsum(cell, water_used) < water_tank, water_drop * 25 * burning, 0))"}}
+  add_rule{name = "clear", kind = "cell", set = {fuel = "if(temp > 60 and burning < 1 and random() < crews * 0.02 and gsum(ops, spent) < crew_budget, 0, fuel)"}}
+  add_rule{name = "pay", kind = "ops", set = {spent = "spent + if(spent < crew_budget, crews * 10, 0)"}}
 
   define_metric{name = "cells burning", kind = "cell", prop = "burning", op = "sum"}
   define_metric{name = "fuel left", kind = "cell", prop = "fuel", op = "sum"}

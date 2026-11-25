@@ -594,4 +594,19 @@ mod tests {
         w.call("play_as", &json!({"role": ""})).unwrap();
         assert!(w.call("set_param", &json!({"name": "rain", "value": 1})).is_ok());
     }
+
+    #[test]
+    fn a_shared_limit_runs_out_using_whole_universe_totals() {
+        let mut s = sim();
+        let w = s.world_mut();
+        for _ in 0..10 {
+            w.call("spawn", &json!({"kind": "c", "props": {"used": 0.0}})).unwrap();
+        }
+        w.call("param", &json!({"name": "tank", "value": 25.0, "min": 0, "max": 100})).unwrap();
+        rule(w, json!({"name": "draw", "kind": "c", "set": {"used": "used + if(gsum(c, used) < tank, 1, 0)"}})).unwrap();
+        s.advance(10);
+        let total: f64 = s.world().get::<Things>().unwrap().things.values().map(|t| t.props["used"].as_f64().unwrap()).sum();
+        // 10 things draw 1 each per tick until the shared total reaches 25, then stop
+        assert!((25.0..=34.0).contains(&total), "total {total}");
+    }
 }
