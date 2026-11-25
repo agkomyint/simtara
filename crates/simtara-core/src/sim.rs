@@ -52,6 +52,7 @@ pub struct Builder<'a> {
     pub world: &'a mut World,
     pub config: &'a Config,
     metrics: &'a mut Vec<(String, MetricFn)>,
+    metric_sources: &'a mut Vec<MetricSource>,
     /// Modules that provide a compute backend (e.g. GPU) register it here.
     pub compute: &'a mut Compute,
     schedule: &'a mut Schedule,
@@ -60,10 +61,17 @@ pub struct Builder<'a> {
 /// A named measurement of the world (population, energy, ...). Agents and tools read these.
 pub type MetricFn = Box<dyn Fn(&World) -> f64 + Send>;
 
+/// Measurements whose names are only known while the universe runs (for example ones a script defined).
+pub type MetricSource = Box<dyn Fn(&World) -> Vec<(String, f64)> + Send>;
+
 impl Builder<'_> {
     /// Register a metric under `name` (convention: `module.metric`).
     pub fn add_metric(&mut self, name: &str, f: impl Fn(&World) -> f64 + Send + 'static) {
         self.metrics.push((name.to_string(), Box::new(f)));
+    }
+    /// Register a provider of measurements whose set can change while running.
+    pub fn add_metric_source(&mut self, f: impl Fn(&World) -> Vec<(String, f64)> + Send + 'static) {
+        self.metric_sources.push(Box::new(f));
     }
     pub fn add_system(&mut self, stage: Stage, s: impl System + 'static) {
         self.schedule.systems.push((stage, Box::new(s)));
@@ -102,6 +110,7 @@ pub struct Simulation {
     world: World,
     schedule: Schedule,
     metrics: Vec<(String, MetricFn)>,
+    metric_sources: Vec<MetricSource>,
     compute: Compute,
     state: RunState,
     speed: f64,
@@ -117,6 +126,7 @@ impl Simulation {
             world: World::new(),
             schedule: Schedule::default(),
             metrics: Vec::new(),
+            metric_sources: Vec::new(),
             compute,
             state: RunState::Paused,
             speed: 1.0,
@@ -132,7 +142,7 @@ impl Simulation {
         self
     }
     fn build_module(&mut self, m: &dyn Module) {
-        let mut b = Builder { world: &mut self.world, config: &self.config, compute: &mut self.compute, schedule: &mut self.schedule, metrics: &mut self.metrics };
+        let mut b = Builder { world: &mut self.world, config: &self.config, compute: &mut self.compute, schedule: &mut self.schedule, metrics: &mut self.metrics, metric_sources: &mut self.metric_sources };
         m.build(&mut b);
     }
 
@@ -141,6 +151,7 @@ impl Simulation {
         self.world = World::new();
         self.schedule = Schedule::default();
         self.metrics.clear();
+        self.metric_sources.clear();
         self.accum = 0.0;
         let modules = std::mem::take(&mut self.modules);
         for m in &modules {
@@ -231,10 +242,14 @@ impl Simulation {
 
     /// Evaluate every registered metric on the current world.
     pub fn collect_metrics(&self) -> BTreeMap<String, f64> {
-        self.metrics.iter().map(|(n, f)| (n.clone(), f(&self.world))).collect()
+        let mut out: BTreeMap<String, f64> = self.metrics.iter().map(|(n, f)| (n.clone(), f(&self.world))).collect();
+        for src in &self.metric_sources {
+            out.extend(src(&self.world));
+        }
+        out
     }
-    pub fn metric_names(&self) -> Vec<&str> {
-        self.metrics.iter().map(|(n, _)| n.as_str()).collect()
+    pub fn metric_names(&self) -> Vec<String> {
+        self.collect_metrics().into_keys().collect()
     }
 
     // ---- persistence ----

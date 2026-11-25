@@ -13,3 +13,4 @@ mlua = { version = "0.12", features = ["luau", "serialize", "send"] }
 
 [dev-dependencies]
 simtara-orbits = { path = "../simtara-orbits" }
+simtara-things = { path = "../simtara-things" }

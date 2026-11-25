@@ -3237,6 +3237,7 @@ dependencies = [
  "serde_json",
  "simtara-core",
  "simtara-orbits",
+ "simtara-things",
 ]
 
 [[package]]
@@ -3262,6 +3263,15 @@ dependencies = [
  "simtara-particles",
  "simtara-script",
  "simtara-store",
+]
+
+[[package]]
+name = "simtara-things"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "simtara-core",
 ]
 
 [[package]]

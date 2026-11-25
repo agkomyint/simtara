@@ -1,6 +1,6 @@
-//! Lua scripting for universes.
+//! Luau scripting for universes.
 //!
-//! A script is a piece of Lua text saved with the universe. Once per tick the
+//! A script is a piece of Luau text saved with the universe. Once per tick the
 //! runtime calls its `on_tick(tick)` function, and the script can ask the
 //! universe to do things through *commands* that modules offer
 //! (`remove_body("Moon")`, `set_mass("Moon", 1e22)`, ...):
@@ -10,6 +10,10 @@
 //!   if t == 1461 then remove_body("Moon") end   -- after one year
 //! end
 //! ```
+//!
+//! A script may also define `setup()`, which runs once at the very start of a
+//! universe, to create things (`spawn{kind = "person", props = {...}}`). Every command
+//! any module registers is available as a function with the same name.
 //!
 //! Rules of the road:
 //! - Top-level code should only define functions (it runs again whenever the script is loaded).
@@ -47,6 +51,8 @@ pub struct ScriptConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScriptState {
     pub source: String,
+    /// True once `setup()` has run, so a saved universe does not set itself up twice.
+    pub setup_done: bool,
     /// Set when the script failed; the script then stays off until its text changes.
     #[serde(skip)]
     pub error: Option<String>,
@@ -83,12 +89,13 @@ function bodies() return call("bodies") end
 
 struct Runtime {
     lua: Lua,
+    setup: Option<mlua::Function>,
     on_tick: Option<mlua::Function>,
     used: Arc<AtomicU64>,
 }
 
 impl Runtime {
-    fn new(source: &str) -> Result<Runtime, String> {
+    fn new(source: &str, commands: &[String]) -> Result<Runtime, String> {
         let lua = Lua::new_with(StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::UTF8, LuaOptions::default()).map_err(|e| e.to_string())?;
         lua.set_memory_limit(MEMORY_LIMIT).map_err(|e| e.to_string())?;
         let used = Arc::new(AtomicU64::new(0));
@@ -114,14 +121,31 @@ impl Runtime {
         // Luau's sandbox: the built-in libraries become read-only and the script gets its own globals.
         lua.sandbox(true).map_err(|e| e.to_string())?;
         lua.load(PRELUDE).exec().map_err(|e| e.to_string())?;
+        // Every command a module offers becomes a function of the same name, so a new
+        // module needs no change here. A number means {id = n}, text means {kind = s}.
+        let mut wrappers = String::new();
+        for name in commands {
+            if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && lua.globals().get::<LuaValue>(name.as_str()).map_err(|e| e.to_string())?.is_nil() {
+                wrappers.push_str(&format!(
+                    "function {name}(a) if type(a) == 'number' then a = {{id = a}} elseif type(a) == 'string' then a = {{kind = a}} end return call('{name}', a) end
+"
+                ));
+            }
+        }
+        lua.load(wrappers).exec().map_err(|e| e.to_string())?;
         used.store(0, Ordering::Relaxed);
         lua.load(source).set_name("script").exec().map_err(|e| e.to_string())?;
+        let setup = lua.globals().get::<Option<mlua::Function>>("setup").map_err(|e| e.to_string())?;
         let on_tick = lua.globals().get::<Option<mlua::Function>>("on_tick").map_err(|e| e.to_string())?;
-        Ok(Runtime { lua, on_tick, used })
+        Ok(Runtime { lua, setup, on_tick, used })
     }
 
-    fn run(&mut self, world: &mut World, tick: u64, log: &mut Vec<String>) -> Result<(), String> {
-        let Some(f) = self.on_tick.clone() else { return Ok(()) };
+    fn run(&mut self, world: &mut World, tick: u64, do_setup: bool, log: &mut Vec<String>) -> Result<(), String> {
+        let setup = if do_setup { self.setup.clone() } else { None };
+        let on_tick = self.on_tick.clone();
+        if setup.is_none() && on_tick.is_none() {
+            return Ok(());
+        }
         self.used.store(0, Ordering::Relaxed);
         let lua = &self.lua;
         let opts = SerializeOptions::new().serialize_none_to_null(false).serialize_unit_to_null(false);
@@ -141,7 +165,13 @@ impl Runtime {
             let g = lua.globals();
             g.set("call", call)?;
             g.set("log", print)?;
-            f.call::<()>(tick)
+            if let Some(f) = setup {
+                f.call::<()>(()).map_err(|e| mlua::Error::runtime(format!("setup: {e}")))?;
+            }
+            if let Some(f) = on_tick {
+                f.call::<()>(tick)?;
+            }
+            Ok(())
         })
         .map_err(|e| e.to_string())
     }
@@ -163,7 +193,7 @@ impl System for ScriptSystem {
             self.runtime = None;
             st.error = None;
             if !st.source.trim().is_empty() {
-                match Runtime::new(&st.source) {
+                match Runtime::new(&st.source, &ctx.world.command_names()) {
                     Ok(r) => self.runtime = Some(r),
                     Err(e) => st.error = Some(e),
                 }
@@ -172,7 +202,9 @@ impl System for ScriptSystem {
         if st.error.is_none() {
             if let Some(rt) = self.runtime.as_mut() {
                 let mut lines = Vec::new();
-                if let Err(e) = rt.run(ctx.world, ctx.tick, &mut lines) {
+                let first = !st.setup_done;
+                st.setup_done = true;
+                if let Err(e) = rt.run(ctx.world, ctx.tick, first, &mut lines) {
                     st.error = Some(format!("tick {}: {e}", ctx.tick));
                 }
                 if !lines.is_empty() {
@@ -194,7 +226,7 @@ impl Module for ScriptModule {
     }
     fn build(&self, b: &mut Builder) {
         let cfg: ScriptConfig = b.config.module(MODULE);
-        b.world.insert_persistent("script", ScriptState { source: cfg.source, error: None, log: Vec::new() });
+        b.world.insert_persistent("script", ScriptState { source: cfg.source, setup_done: false, error: None, log: Vec::new() });
         // PreUpdate: events happen before the physics of the same tick.
         b.add_system(Stage::PreUpdate, ScriptSystem { loaded: None, runtime: None });
     }
@@ -312,5 +344,56 @@ mod tests {
         sim.advance(5);
         assert_eq!(bodies(&sim), 3);
         assert!(status(sim.world()).0.is_none());
+    }
+
+    const IDEA_SPREADS: &str = r#"
+function setup()
+  for i = 1, 40 do
+    spawn{kind = "person", props = {knows_idea = (i == 1)}}
+  end
+  define_metric{name = "idea.believers", kind = "person", prop = "knows_idea", op = "sum"}
+end
+function on_tick(t)
+  local people = things("person")
+  for _, p in ipairs(people) do
+    if p.knows_idea == false then
+      local other = people[1 + math.floor(random() * #people)]
+      if other.knows_idea and random() < 0.3 then set{id = p.id, props = {knows_idea = true}} end
+    end
+  end
+end
+"#;
+
+    fn idea_universe(seed: u64) -> Simulation {
+        let mut config = Config { seed, ..Config::default() };
+        config.set_module(MODULE, &ScriptConfig { source: IDEA_SPREADS.into() });
+        let mut sim = Simulation::new(config);
+        sim.add_module(simtara_things::ThingsModule);
+        sim.add_module(ScriptModule);
+        sim
+    }
+
+    #[test]
+    fn an_idea_can_spread_through_people_with_no_bodies_at_all() {
+        let mut sim = idea_universe(7);
+        sim.advance(1);
+        let m = sim.collect_metrics();
+        assert_eq!(m["things.count.person"], 40.0, "setup ran once");
+        let early = m["idea.believers"];
+        sim.advance(60);
+        let late = sim.collect_metrics()["idea.believers"];
+        assert!(status(sim.world()).0.is_none(), "{:?}", status(sim.world()));
+        assert!(late > early && late <= 40.0, "{early} -> {late}");
+        // same seed, same story; setup does not run again after a snapshot
+        let snap = sim.snapshot().unwrap();
+        let mut again = idea_universe(7);
+        again.advance(61);
+        assert_eq!(again.collect_metrics()["idea.believers"], late);
+        let mut restored = Simulation::new(snap.config.clone());
+        restored.add_module(simtara_things::ThingsModule);
+        restored.add_module(ScriptModule);
+        restored.restore(&snap).unwrap();
+        restored.advance(1);
+        assert_eq!(restored.collect_metrics()["things.count.person"], 40.0);
     }
 }

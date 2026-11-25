@@ -274,7 +274,7 @@ impl Engine {
                 series.get_mut(n).unwrap().push(m.get(n).copied().unwrap_or(f64::NAN));
             }
         };
-        if let Some(bad) = names.iter().find(|n| !s.sim.metric_names().contains(&n.as_str())) {
+        if let Some(bad) = names.iter().find(|n| !s.sim.metric_names().contains(n)) {
             return Err(format!("unknown metric '{bad}' (available: {:?})", s.sim.metric_names()));
         }
         let start = s.sim.world().clock.tick;

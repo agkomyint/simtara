@@ -1,0 +1,11 @@
+[package]
+name = "simtara-things"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Domain-neutral things for SimTara: kinds, properties, relations and measurements for people, ideas, water, places, anything"
+
+[dependencies]
+simtara-core = { path = "../simtara-core" }
+serde.workspace = true
+serde_json.workspace = true
