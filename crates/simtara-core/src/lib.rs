@@ -14,5 +14,5 @@ pub mod world;
 pub use compute::{Backend, Compute};
 pub use config::Config;
 pub use rng::Rng;
-pub use sim::{Builder, Context, Module, RunState, Simulation, Snapshot, Stage, System};
+pub use sim::{Builder, Context, MetricFn, Module, RunState, Simulation, Snapshot, Stage, System};
 pub use world::{Clock, ComponentStore, Entity, World};

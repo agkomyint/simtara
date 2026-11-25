@@ -242,6 +242,23 @@ fn view(o: &HashMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
+/// JSON-lines control interface: one request per stdin line, one response per stdout line.
+fn serve(o: &HashMap<String, String>) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+    let mut engine = simtara_api::Engine::new(o.get("backend").map(String::as_str) != Some("cpu"));
+    let stdout = std::io::stdout();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut out = stdout.lock();
+        writeln!(out, "{}", engine.handle_line(&line)).map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("view");
@@ -249,8 +266,9 @@ fn main() {
     let result = match cmd {
         "run" => run(&opts),
         "view" => view(&opts),
+        "serve" => serve(&opts),
         _ => {
-            println!("usage: simtara <run|view> [--particles N] [--kinds K] [--seed S] [--steps N] [--spread X] [--base X] [--load F] [--save F] [--png F]");
+            println!("usage: simtara <run|view|serve> [--particles N] [--kinds K] [--seed S] [--steps N] [--spread X] [--base X] [--load F] [--save F] [--png F]");
             return;
         }
     };

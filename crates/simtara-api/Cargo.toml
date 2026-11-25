@@ -1,0 +1,16 @@
+[package]
+name = "simtara-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["gpu"]
+gpu = ["dep:simtara-gpu"]
+
+[dependencies]
+simtara-core = { path = "../simtara-core" }
+simtara-particles = { path = "../simtara-particles" }
+simtara-gpu = { path = "../simtara-gpu", optional = true }
+serde.workspace = true
+serde_json.workspace = true

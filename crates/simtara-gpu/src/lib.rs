@@ -248,6 +248,7 @@ impl System for GpuForceSystem {
 
 /// Plug-in that adds the GPU backend. Falls back to CPU silently if no GPU is available
 /// (check `available()` to find out).
+#[derive(Clone)]
 pub struct GpuModule {
     ctx: Option<Arc<GpuContext>>,
     pub error: Option<String>,

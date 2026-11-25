@@ -51,3 +51,16 @@ Current GPU design: the CPU builds the spatial grid and applies velocities; the 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Control API (for tools and AI agents)
+
+`simtara serve` reads one JSON request per line on stdin and writes one JSON response per line on stdout:
+
+```
+{"id":1,"cmd":"world.create","args":{"name":"u1","seed":7,"config":{"count":2000}}}
+{"id":2,"cmd":"experiment.branch","args":{"name":"u1","new_name":"u2"}}
+{"id":3,"cmd":"world.configure","args":{"name":"u2","resource":"particle_params","patch":{"gravity":4}}}
+{"id":4,"cmd":"experiment.run","args":{"name":"u2","ticks":500,"sample_every":100}}
+```
+
+Send `{"cmd":"capabilities"}` for the full command list. Worlds are independent, so branch, change one law, run both, and compare metrics.

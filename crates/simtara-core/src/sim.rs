@@ -51,12 +51,20 @@ struct Schedule {
 pub struct Builder<'a> {
     pub world: &'a mut World,
     pub config: &'a Config,
+    metrics: &'a mut Vec<(String, MetricFn)>,
     /// Modules that provide a compute backend (e.g. GPU) register it here.
     pub compute: &'a mut Compute,
     schedule: &'a mut Schedule,
 }
 
+/// A named measurement of the world (population, energy, ...). Agents and tools read these.
+pub type MetricFn = Box<dyn Fn(&World) -> f64 + Send>;
+
 impl Builder<'_> {
+    /// Register a metric under `name` (convention: `module.metric`).
+    pub fn add_metric(&mut self, name: &str, f: impl Fn(&World) -> f64 + Send + 'static) {
+        self.metrics.push((name.to_string(), Box::new(f)));
+    }
     pub fn add_system(&mut self, stage: Stage, s: impl System + 'static) {
         self.schedule.systems.push((stage, Box::new(s)));
         // stable sort keeps registration order inside each stage
@@ -93,6 +101,7 @@ pub struct Simulation {
     modules: Vec<Box<dyn Module>>,
     world: World,
     schedule: Schedule,
+    metrics: Vec<(String, MetricFn)>,
     compute: Compute,
     state: RunState,
     speed: f64,
@@ -107,6 +116,7 @@ impl Simulation {
             modules: Vec::new(),
             world: World::new(),
             schedule: Schedule::default(),
+            metrics: Vec::new(),
             compute,
             state: RunState::Paused,
             speed: 1.0,
@@ -122,7 +132,7 @@ impl Simulation {
         self
     }
     fn build_module(&mut self, m: &dyn Module) {
-        let mut b = Builder { world: &mut self.world, config: &self.config, compute: &mut self.compute, schedule: &mut self.schedule };
+        let mut b = Builder { world: &mut self.world, config: &self.config, compute: &mut self.compute, schedule: &mut self.schedule, metrics: &mut self.metrics };
         m.build(&mut b);
     }
 
@@ -130,6 +140,7 @@ impl Simulation {
     pub fn reset(&mut self) {
         self.world = World::new();
         self.schedule = Schedule::default();
+        self.metrics.clear();
         self.accum = 0.0;
         let modules = std::mem::take(&mut self.modules);
         for m in &modules {
@@ -207,11 +218,23 @@ impl Simulation {
         &mut self.compute
     }
     /// The backend that will actually run (requested one if available, else CPU).
+    /// The backend the user asked for (may not be available).
+    pub fn compute_requested(&self) -> Backend {
+        self.compute.requested()
+    }
     pub fn backend(&self) -> Backend {
         self.compute.active()
     }
     pub fn system_names(&self) -> Vec<&str> {
         self.schedule.systems.iter().map(|(_, s)| s.name()).collect()
+    }
+
+    /// Evaluate every registered metric on the current world.
+    pub fn collect_metrics(&self) -> BTreeMap<String, f64> {
+        self.metrics.iter().map(|(n, f)| (n.clone(), f(&self.world))).collect()
+    }
+    pub fn metric_names(&self) -> Vec<&str> {
+        self.metrics.iter().map(|(n, _)| n.as_str()).collect()
     }
 
     // ---- persistence ----

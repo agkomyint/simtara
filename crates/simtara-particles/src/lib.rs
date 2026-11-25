@@ -140,6 +140,9 @@ impl Module for ParticleModule {
         b.add_system(Stage::Update, ForceSystem);
         b.add_system(Stage::Update, IntegrateSystem);
         b.add_system(Stage::Update, BoundarySystem);
+        b.add_metric("particles.count", |w| w.get::<Particles>().map_or(0.0, |p| p.len() as f64));
+        b.add_metric("particles.kinetic_energy", |w| kinetic_energy(w) as f64);
+        b.add_metric("particles.mean_neighbors", |w| mean_neighbors(w) as f64);
     }
 }
 
@@ -393,14 +396,19 @@ pub struct Stats {
     pub mean_neighbors: f32,
 }
 
-pub fn stats(world: &World) -> Option<Stats> {
-    let p = world.get::<Particles>()?;
-    let prm = world.get::<ParticleParams>()?;
+pub fn kinetic_energy(world: &World) -> f32 {
+    let Some(p) = world.get::<Particles>() else { return 0.0 };
+    let n = p.len().max(1);
+    (0..p.len()).map(|i| 0.5 * p.mass[i] * (p.vx[i] * p.vx[i] + p.vy[i] * p.vy[i])).sum::<f32>() / n as f32
+}
+
+/// Sampled mean number of neighbours within rmax/2. Rising = clustering.
+pub fn mean_neighbors(world: &World) -> f32 {
+    let (Some(p), Some(prm)) = (world.get::<Particles>(), world.get::<ParticleParams>()) else { return 0.0 };
     let n = p.len();
     if n == 0 {
-        return Some(Stats { count: 0, kinetic_energy: 0.0, mean_neighbors: 0.0 });
+        return 0.0;
     }
-    let ke = (0..n).map(|i| 0.5 * p.mass[i] * (p.vx[i] * p.vx[i] + p.vy[i] * p.vy[i])).sum::<f32>() / n as f32;
     let r2 = (prm.rmax * 0.5).powi(2);
     let step = (n / 400).max(1);
     let sample: Vec<usize> = (0..n).step_by(step).collect();
@@ -408,7 +416,12 @@ pub fn stats(world: &World) -> Option<Stats> {
         .par_iter()
         .map(|&i| (0..n).filter(|&j| j != i && (p.x[i] - p.x[j]).powi(2) + (p.y[i] - p.y[j]).powi(2) < r2).count())
         .sum();
-    Some(Stats { count: n, kinetic_energy: ke, mean_neighbors: total as f32 / sample.len() as f32 })
+    total as f32 / sample.len() as f32
+}
+
+pub fn stats(world: &World) -> Option<Stats> {
+    let p = world.get::<Particles>()?;
+    Some(Stats { count: p.len(), kinetic_energy: kinetic_energy(world), mean_neighbors: mean_neighbors(world) })
 }
 
 #[cfg(test)]
