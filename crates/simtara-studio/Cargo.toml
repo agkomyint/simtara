@@ -12,4 +12,5 @@ path = "src/main.rs"
 simtara-core = { path = "../simtara-core" }
 simtara-particles = { path = "../simtara-particles" }
 simtara-gpu = { path = "../simtara-gpu" }
+simtara-store = { path = "../simtara-store" }
 eframe = "0.37"

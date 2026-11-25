@@ -1,0 +1,12 @@
+[package]
+name = "simtara-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Saving and loading SimTara universes and experiments as folders on disk"
+
+[dependencies]
+simtara-core = { path = "../simtara-core" }
+simtara-particles = { path = "../simtara-particles" }
+serde.workspace = true
+serde_json.workspace = true

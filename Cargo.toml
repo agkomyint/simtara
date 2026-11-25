@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/simtara-core", "crates/simtara-particles", "crates/simtara-gpu", "crates/simtara-api", "crates/simtara-cli", "crates/simtara-studio"]
+members = ["crates/simtara-core", "crates/simtara-particles", "crates/simtara-gpu", "crates/simtara-api", "crates/simtara-store", "crates/simtara-cli", "crates/simtara-studio"]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-license = "MIT"
+license = "Elastic-2.0"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 rayon = "1"
 
 [profile.release]

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Save and reopen universes.** New `simtara-store` crate stores a universe as a folder (`universe.json` + `state.snap.json`, with a `schema_version`) under `Documents/SimTara/universes/` (override with `SIMTARA_HOME`). Studio launcher gets a "My universes" list (open, delete) and a Save button; leaving a saved universe autosaves it. `simtara-studio --open "<name>"` skips the launcher.
+- **Experiments.** In the Studio, change one law (gravity, friction, range, core repel, charge), run the original and the changed version from the same moment on CPU, and see a two-line chart. Results are saved with the universe (`experiment.json`, `results.json`, the exact `start.snap.json`, and a run record: engine version, seed, backend, time) and shown again on reopen.
+- `serde_json` now uses `float_roundtrip`, so saved numbers reload bit-for-bit (found by a test: results changed in the last digit after a save).
+- **License changed from MIT to Elastic License 2.0** (no hosted/managed-service use). v0.1.0 and v0.2.0 remain MIT. Added ENTERPRISE.md describing the planned commercial tier.
+
 ## v0.2.0
 
 - New `simtara-studio` app: launcher with parameter sliders, then live universe with control panel (play/pause, live laws, particle count, CPU/GPU, metrics graph).

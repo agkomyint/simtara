@@ -50,7 +50,9 @@ Current GPU design: the CPU builds the spatial grid and applies velocities; the 
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Elastic License 2.0 - see [LICENSE](LICENSE). Free to use and modify, but you may not offer SimTara as a hosted or managed service. Organization features are planned under a separate commercial license, see [ENTERPRISE.md](ENTERPRISE.md).
+
+Versions v0.1.0 and v0.2.0 were released under the MIT license and remain available under those terms.
 
 ## Control API (for tools and AI agents)
 

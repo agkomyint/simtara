@@ -1,3 +1,4 @@
 target/
 *.snap.json
 *.png
+dist/
