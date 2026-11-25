@@ -1,6 +1,8 @@
 //! `simtara` CLI.
 //!
 //!   simtara run  [opts]   headless: advance N ticks, print stats, optionally save/render
+//!   simtara script FILE   run a script universe, print a JSON report (--ticks --seed --expect)
+//!   simtara describe      everything a script can use, as JSON
 //!   simtara view [opts]   live window: Play/Pause, Reset, Gravity, Count, Speed
 //!
 //! opts: --backend gpu|cpu  --particles N  --kinds K  --seed S  --steps N  --spread X  --base X
@@ -259,6 +261,40 @@ fn serve(o: &HashMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
+/// `simtara script FILE [--ticks N] [--seed S] [--expect "metric >= 10; other < 5"]`
+/// Runs a script universe headless and prints a JSON report. Exit code 1 if anything failed.
+fn script(args: &[String]) -> Result<(), String> {
+    let file = args.first().filter(|a| !a.starts_with("--")).ok_or("usage: simtara script FILE [--ticks N] [--seed S] [--expect \"metric >= 10; ...\"]")?;
+    let o = parse(&args[1..]);
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let expects: Vec<String> = o.get("expect").map(|e| e.split(';').map(str::to_string).filter(|x| !x.trim().is_empty()).collect()).unwrap_or_default();
+    let r = simtara_store::run_script_report(&src, get(&o, "seed", 1), get(&o, "ticks", 200), &expects);
+    println!("{}", serde_json::to_string_pretty(&r).unwrap());
+    if r["ok"] == serde_json::json!(true) { Ok(()) } else { Err("script failed (see report)".into()) }
+}
+
+/// `simtara describe`: everything a script can use, as JSON, for coding agents.
+fn describe() -> Result<(), String> {
+    let sim = simtara_store::build_simulation(&simtara_store::new_build_config(1, ""));
+    let d = serde_json::json!({
+        "script_language": "Luau (typed Lua). Define setup() (runs once, tick 0) and optionally on_tick(t). math.random is removed: use random().",
+        "commands": sim.world().command_names(),
+        "command_args": "Commands take one table, e.g. spawn{kind=\"person\", props={age=3}}. A number argument means {id=n}; a string means {kind=s}.",
+        "property_values": "number, text or true/false only",
+        "metrics": {"define_metric": "define_metric{name, kind, prop, op}", "ops": ["count", "sum", "mean", "min", "max"], "auto": ["things.total", "things.count.<kind>"]},
+        "rules": {
+            "add_rule": "add_rule{name, kind, when?, set?{prop=formula}, remove_when?, every?}",
+            "operators": ["+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "and", "or", "not"],
+            "functions": ["random()", "tick()", "min", "max", "abs", "sqrt", "floor", "clamp(x,lo,hi)", "if(c,a,b)"],
+            "neighbours": ["ncount(rel[,prop])", "nsum", "nmean", "nmax", "nmin", "wsum", "wmean"],
+            "notes": "Updates are synchronous (all things read the old state). Unknown properties read as 0; see the 'warnings' command.",
+        },
+        "test_loop": "simtara script FILE --ticks 200 --expect \"metric >= 10; other < 5\" prints a JSON report; exit code 1 on failure.",
+    });
+    println!("{}", serde_json::to_string_pretty(&d).unwrap());
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("view");
@@ -267,8 +303,10 @@ fn main() {
         "run" => run(&opts),
         "view" => view(&opts),
         "serve" => serve(&opts),
+        "script" => script(&args[1..]),
+        "describe" => describe(),
         _ => {
-            println!("usage: simtara <run|view|serve> [--particles N] [--kinds K] [--seed S] [--steps N] [--spread X] [--base X] [--load F] [--save F] [--png F]");
+            println!("usage: simtara <run|view|serve|script|describe> [--particles N] [--kinds K] [--seed S] [--steps N] [--spread X] [--base X] [--load F] [--save F] [--png F]");
             return;
         }
     };

@@ -312,6 +312,7 @@ fn register_commands(w: &mut World) {
         }
         Ok(json!(true))
     });
+    w.register_command("warnings", |w, _| Ok(json!(things_mut(w)?.warnings())));
     w.register_command("rules", |w, _| {
         let t = things_mut(w)?;
         Ok(Value::Array(
@@ -461,5 +462,17 @@ mod tests {
         let n = a.collect_metrics()["things.count.c"];
         assert!(n < 100_000.0 && n > 99_000.0, "{n}");
         eprintln!("100k things x 5 ticks: {took:?}");
+    }
+
+    #[test]
+    fn a_misspelt_property_is_flagged() {
+        let mut s = sim();
+        let w = s.world_mut();
+        w.call("spawn", &json!({"kind": "p", "props": {"energy": 1.0}})).unwrap();
+        rule(w, json!({"name": "r", "kind": "p", "set": {"energy": "enrgy + 1"}})).unwrap();
+        let warn = w.call("warnings", &json!({})).unwrap();
+        assert!(warn[0].as_str().unwrap().contains("enrgy"), "{warn}");
+        rule(w, json!({"name": "r", "kind": "p", "set": {"energy": "energy + 1"}})).unwrap();
+        assert_eq!(w.call("warnings", &json!({})).unwrap(), json!([]));
     }
 }

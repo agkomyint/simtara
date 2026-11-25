@@ -621,3 +621,103 @@ mod tests {
         assert_eq!(back[0].spec.alt_script.as_deref(), Some("function on_tick(t) remove_body('Moon') end"));
     }
 }
+
+/// One check like `people who know >= 100` against the final measurements.
+fn check_expectation(spec: &str, m: &std::collections::BTreeMap<String, f64>) -> serde_json::Value {
+    use serde_json::json;
+    let spec = spec.trim();
+    for op in [">=", "<=", "==", "!=", ">", "<"] {
+        if let Some(i) = spec.rfind(op) {
+            let (name, rhs) = (spec[..i].trim(), spec[i + op.len()..].trim());
+            let Ok(want) = rhs.parse::<f64>() else { continue };
+            let Some(&got) = m.get(name) else {
+                return json!({"check": spec, "pass": false, "why": format!("no measurement named '{name}'; have: {}", m.keys().cloned().collect::<Vec<_>>().join(", "))});
+            };
+            let pass = match op {
+                ">=" => got >= want,
+                "<=" => got <= want,
+                "==" => got == want,
+                "!=" => got != want,
+                ">" => got > want,
+                _ => got < want,
+            };
+            return json!({"check": spec, "pass": pass, "got": got});
+        }
+    }
+    json!({"check": spec, "pass": false, "why": "write a check like: name >= 10 (operators: >= <= == != > <)"})
+}
+
+/// Build a universe from a script, run it, and describe what happened as JSON: the build-and-test
+/// loop for people and coding agents. `expects` are checks like `people who know >= 100`.
+pub fn run_script_report(script: &str, seed: u64, ticks: u64, expects: &[String]) -> serde_json::Value {
+    use serde_json::json;
+    let t0 = std::time::Instant::now();
+    let mut sim = build_simulation(&new_build_config(seed, script));
+    let samples = 60u64.min(ticks.max(1));
+    let every = (ticks / samples).max(1);
+    let mut series: std::collections::BTreeMap<String, Vec<[f64; 2]>> = Default::default();
+    let mut sample = |sim: &Simulation, series: &mut std::collections::BTreeMap<String, Vec<[f64; 2]>>| {
+        let tick = sim.world().clock.tick as f64;
+        for (k, v) in sim.collect_metrics() {
+            series.entry(k).or_default().push([tick, v]);
+        }
+    };
+    sample(&sim, &mut series);
+    let mut done = 0;
+    while done < ticks {
+        let n = every.min(ticks - done);
+        sim.advance(n);
+        done += n;
+        sample(&sim, &mut series);
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let (error, log) = simtara_script::status(sim.world());
+    let metrics = sim.collect_metrics();
+    let (mut kinds, mut relations, mut rules, mut warnings) = (std::collections::BTreeMap::<String, usize>::new(), 0, vec![], vec![]);
+    if let Some(t) = sim.world().get::<simtara_things::Things>() {
+        for th in t.things.values() {
+            *kinds.entry(th.kind.clone()).or_default() += 1;
+        }
+        relations = t.relations.len();
+        rules = t.rules.iter().map(|r| json!({"name": r.name, "kind": r.kind, "enabled": r.enabled, "error": r.error})).collect();
+        warnings = t.warnings();
+    }
+    // The same script and seed must give the same universe.
+    let mut again = build_simulation(&new_build_config(seed, script));
+    again.advance(ticks);
+    let repeatable = match (sim.snapshot(), again.snapshot()) {
+        (Ok(a), Ok(b)) => a.state == b.state,
+        _ => false,
+    };
+    let checks: Vec<serde_json::Value> = expects.iter().map(|e| check_expectation(e, &metrics)).collect();
+    let rule_broke = rules.iter().any(|r: &serde_json::Value| !r["error"].is_null());
+    let ok = error.is_none() && !rule_broke && checks.iter().all(|c| c["pass"] == json!(true));
+    json!({
+        "ok": ok, "error": error, "ticks": ticks, "seed": seed, "ms": ms, "repeatable": repeatable,
+        "log": log.iter().take(100).collect::<Vec<_>>(),
+        "metrics": metrics, "series": series,
+        "things": {"by_kind": kinds, "relations": relations},
+        "rules": rules, "warnings": warnings, "checks": checks,
+    })
+}
+
+#[cfg(test)]
+mod script_report_tests {
+    use super::*;
+
+    const S: &str = "function setup()\n  for i = 1, 20 do spawn{kind = \"p\", props = {v = i}} end\n  define_metric{name = \"total v\", kind = \"p\", prop = \"v\", op = \"sum\"}\n  add_rule{name = \"grow\", kind = \"p\", set = {v = \"v + 1\"}}\nend\n";
+
+    #[test]
+    fn a_script_reports_checks_and_repeats() {
+        let r = run_script_report(S, 1, 10, &["total v == 410".into(), "total v > 1000".into(), "nope > 1".into()]);
+        assert_eq!(r["error"], serde_json::Value::Null);
+        assert_eq!(r["repeatable"], serde_json::json!(true));
+        assert_eq!(r["checks"][0]["pass"], serde_json::json!(true), "{r}");
+        assert_eq!(r["checks"][1]["pass"], serde_json::json!(false));
+        assert!(r["checks"][2]["why"].as_str().unwrap().contains("total v"));
+        assert_eq!(r["ok"], serde_json::json!(false));
+        let bad = run_script_report("function setup() oops( end", 1, 3, &[]);
+        assert_eq!(bad["ok"], serde_json::json!(false));
+        assert!(bad["error"].is_string());
+    }
+}

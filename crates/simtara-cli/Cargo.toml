@@ -13,6 +13,7 @@ simtara-core = { path = "../simtara-core" }
 simtara-particles = { path = "../simtara-particles" }
 simtara-gpu = { path = "../simtara-gpu" }
 simtara-api = { path = "../simtara-api" }
+simtara-store = { path = "../simtara-store" }
 serde_json.workspace = true
 minifb = "0.28"
 png = "0.17"

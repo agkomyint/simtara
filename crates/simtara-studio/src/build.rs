@@ -11,9 +11,10 @@ use simtara_store::{Store, TEMPLATE_BUILD};
 use simtara_things::Things;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXAMPLES: [(&str, &str, &str); 3] = [
+pub const EXAMPLES: [(&str, &str, &str); 4] = [
     ("Empty universe", "A blank page with a few hints. Describe what exists, then the rules.", EMPTY),
     ("An idea spreads", "1,500 people, 3 of them know an idea. Each tells friends. No physics at all.", IDEA),
+    ("Typed (Luau types)", "The same crowd, written with Luau type annotations so mistakes are caught early.", TYPED),
     ("An epidemic", "A disease moving through contacts: people get sick, then immune.", EPIDEMIC),
 ];
 
@@ -50,6 +51,34 @@ function setup()
   -- every tick, each person who doesn't know yet may hear it from friends who do
   add_rule{name = "spread", kind = "person",
            when = "knows == 0 and random() < 0.12 * ncount(friend, knows)",
+           set = {knows = "true"}}
+end
+"##;
+
+const TYPED: &str = r##"-- Luau lets you describe your data with types. They are checked when the script loads.
+type Person = {knows: boolean, friends: number}
+
+local PEOPLE: number = 800
+
+local function makePerson(i: number): Person
+  return {knows = i <= 2, friends = 5}
+end
+
+function setup()
+  local ids: {number} = {}
+  for i = 1, PEOPLE do
+    local p = makePerson(i)
+    ids[i] = spawn{kind = "person", props = {knows = p.knows}}
+  end
+  for i = 1, PEOPLE do
+    local p = makePerson(i)
+    for _ = 1, p.friends do
+      relate{from = ids[i], to = ids[1 + math.floor(random() * PEOPLE)], kind = "friend"}
+    end
+  end
+  define_metric{name = "people who know", kind = "person", prop = "knows", op = "sum"}
+  add_rule{name = "spread", kind = "person",
+           when = "knows == 0 and random() < 0.15 * ncount(friend, knows)",
            set = {knows = "true"}}
 end
 "##;
@@ -108,6 +137,7 @@ enum Tab {
     Charts,
     Things,
     Rules,
+    Test,
     Reference,
 }
 
@@ -126,6 +156,9 @@ pub struct BuildView {
     last_tick: Option<u64>,
     ms: f32,
     commands: Vec<String>,
+    test_ticks: u64,
+    test_checks: String,
+    report: Option<Value>,
 }
 
 fn make(seed: u64, script: &str, speed: f64) -> Simulation {
@@ -158,6 +191,9 @@ impl BuildView {
             last_tick: None,
             ms: 0.0,
             commands,
+            test_ticks: 200,
+            test_checks: "people who know > 10".into(),
+            report: None,
         }
     }
 
@@ -336,7 +372,7 @@ impl BuildView {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                for (tab, label) in [(Tab::Charts, "📈 Measurements"), (Tab::Things, "🧩 Things"), (Tab::Rules, "📏 Rules"), (Tab::Reference, "📖 Reference")] {
+                for (tab, label) in [(Tab::Charts, "📈 Measurements"), (Tab::Things, "🧩 Things"), (Tab::Rules, "📏 Rules"), (Tab::Test, "✅ Test"), (Tab::Reference, "📖 Reference")] {
                     ui.selectable_value(&mut self.tab, tab, label);
                 }
             });
@@ -345,6 +381,7 @@ impl BuildView {
                 Tab::Charts => self.charts(ui),
                 Tab::Things => self.things(ui),
                 Tab::Rules => self.rules(ui),
+                Tab::Test => self.test(ui),
                 Tab::Reference => self.reference(ui),
             }
         });
@@ -459,7 +496,11 @@ impl BuildView {
             return;
         }
         let mut toggles = Vec::new();
+        let warnings = self.sim.world().get::<Things>().map(|t| t.warnings()).unwrap_or_default();
         egui::ScrollArea::vertical().show(ui, |ui| {
+            for w in &warnings {
+                ui.colored_label(egui::Color32::from_rgb(240, 200, 90), format!("⚠ {w}"));
+            }
             for r in &rules {
                 egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -489,6 +530,51 @@ impl BuildView {
         for (name, on) in toggles {
             let _ = self.sim.world_mut().call("enable_rule", &json!({"name": name, "on": on}));
         }
+    }
+
+    /// Build and test: run this script from scratch, headless, and check the result.
+    fn test(&mut self, ui: &mut egui::Ui) {
+        ui.weak("Runs your script in a fresh universe (separate from the one on the left), then checks the results. Same engine as `simtara script` on the command line.");
+        ui.horizontal(|ui| {
+            ui.label("ticks");
+            ui.add(egui::DragValue::new(&mut self.test_ticks).range(1..=20000));
+        });
+        ui.label("Checks, one per line, like  people who know >= 100  (operators: >= <= == != > <)");
+        ui.add(egui::TextEdit::multiline(&mut self.test_checks).desired_rows(3).desired_width(f32::INFINITY).font(egui::FontId::monospace(13.0)));
+        if ui.add(egui::Button::new("▶ Build & test").fill(egui::Color32::from_rgb(40, 110, 70))).clicked() {
+            let checks: Vec<String> = self.test_checks.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect();
+            self.report = Some(simtara_store::run_script_report(&self.script, self.seed, self.test_ticks, &checks));
+        }
+        let Some(r) = &self.report else { return };
+        ui.add_space(8.0);
+        let ok = r["ok"] == json!(true);
+        ui.label(egui::RichText::new(if ok { "✔ PASSED" } else { "✘ FAILED" }).size(20.0).strong().color(if ok { egui::Color32::LIGHT_GREEN } else { egui::Color32::LIGHT_RED }));
+        ui.weak(format!("{} ticks in {:.0} ms · repeatable with the same seed: {}", r["ticks"], r["ms"].as_f64().unwrap_or(0.0), if r["repeatable"] == json!(true) { "yes" } else { "NO" }));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if let Some(e) = r["error"].as_str() {
+                ui.colored_label(egui::Color32::LIGHT_RED, format!("⚠ script error: {e}"));
+            }
+            for c in r["checks"].as_array().into_iter().flatten() {
+                let pass = c["pass"] == json!(true);
+                let detail = c["why"].as_str().map(str::to_string).or_else(|| c["got"].as_f64().map(|g| format!("got {}", fmt(g)))).unwrap_or_default();
+                ui.colored_label(if pass { egui::Color32::LIGHT_GREEN } else { egui::Color32::LIGHT_RED }, format!("{} {}   {}", if pass { "✔" } else { "✘" }, c["check"].as_str().unwrap_or(""), detail));
+            }
+            for rule in r["rules"].as_array().into_iter().flatten() {
+                if let Some(e) = rule["error"].as_str() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("⚠ rule '{}' broke: {e}", rule["name"].as_str().unwrap_or("")));
+                }
+            }
+            for w in r["warnings"].as_array().into_iter().flatten() {
+                ui.colored_label(egui::Color32::from_rgb(240, 200, 90), format!("⚠ {}", w.as_str().unwrap_or("")));
+            }
+            ui.add_space(6.0);
+            ui.strong("Final measurements");
+            if let Some(m) = r["metrics"].as_object() {
+                for (k, v) in m {
+                    ui.monospace(format!("{k}: {}", fmt(v.as_f64().unwrap_or(0.0))));
+                }
+            }
+        });
     }
 
     fn reference(&mut self, ui: &mut egui::Ui) {
@@ -633,6 +719,8 @@ mod tests {
         for (i, (title, _, _)) in EXAMPLES.iter().enumerate() {
             let mut v = BuildView::new(i, 7, "t".into());
             v.sim.advance(60);
+            let r = simtara_store::run_script_report(&v.script, 7, 40, &[]);
+            assert!(r["ok"] == json!(true) && r["warnings"].as_array().unwrap().is_empty(), "{title}: {r}");
             let (err, _) = simtara_script::status(v.sim.world());
             assert!(err.is_none(), "{title}: {err:?}");
         }

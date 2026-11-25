@@ -3188,6 +3188,7 @@ dependencies = [
  "simtara-core",
  "simtara-gpu",
  "simtara-particles",
+ "simtara-store",
 ]
 
 [[package]]

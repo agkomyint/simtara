@@ -477,7 +477,7 @@ fn orbit_controls(ui: &mut egui::Ui, run: &mut Running) {
         }
     });
     ui.separator();
-    ui.strong("Script (Lua)");
+    ui.strong("Script (Luau)");
     ui.weak("on_tick(t) runs every tick. Commands: hide_body(name), show_body(name), remove_body(name), set_mass(name, kg), body(name), log(...)");
     ui.add(egui::TextEdit::multiline(&mut run.script_text).code_editor().desired_rows(8).desired_width(f32::INFINITY));
     let applied = simtara_script::source(run.sim.world());

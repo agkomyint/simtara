@@ -594,3 +594,46 @@ impl Things {
         }
     }
 }
+
+// ---------- warnings ----------
+
+fn reads(e: &Expr, out: &mut Vec<(String, bool)>) {
+    // (property, read from a neighbour)
+    match e {
+        Expr::Prop(p) if p != "id" && p != "kind" => out.push((p.clone(), false)),
+        Expr::Neg(a) | Expr::Not(a) => reads(a, out),
+        Expr::Bin(_, a, b) => {
+            reads(a, out);
+            reads(b, out);
+        }
+        Expr::Call(_, args) => args.iter().for_each(|a| reads(a, out)),
+        Expr::Agg(_, _, Some(p)) => out.push((p.clone(), true)),
+        _ => {}
+    }
+}
+
+impl Things {
+    /// Plain-language hints about likely mistakes: a rule reads a property that no thing has and
+    /// no rule sets (usually a typo; it silently reads as 0).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut known: std::collections::BTreeSet<&str> = self.things.values().flat_map(|t| t.props.keys().map(String::as_str)).collect();
+        for r in &self.rules {
+            known.extend(r.set.keys().map(String::as_str));
+        }
+        let mut out = Vec::new();
+        for r in &self.rules {
+            let Ok(c) = compile(r) else { continue };
+            let mut used = Vec::new();
+            for e in c.when.iter().chain(c.remove.iter()).chain(c.set.iter().map(|(_, e)| e)) {
+                reads(e, &mut used);
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for (p, _) in used {
+                if !known.contains(p.as_str()) && seen.insert(p.clone()) {
+                    out.push(format!("rule '{}' reads '{}', which no thing has and no rule sets (typo? it reads as 0)", r.name, p));
+                }
+            }
+        }
+        out
+    }
+}
