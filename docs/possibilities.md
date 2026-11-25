@@ -119,3 +119,48 @@ Needed to make it a real study tool:
 5. Validation: each science module must reproduce a known result and ship with that test.
 
 **Honest framing.** SimTara is a platform, not a model. Scientific value comes from each module's correctness. The claim to make is "reproducible, comparable what-if experiments for models people build", not "discovers things". A fast, clear loop for building and testing models is a real contribution; the discovery comes from the model and its data.
+
+## 6. AI and learning
+
+SimTara should not compete with ML frameworks. Training a real model needs tensor math, automatic differentiation and GPU matrix kernels (PyTorch, JAX); SimTara's rules are scalar formulas over things.
+
+**Realistic uses**
+- **Gradient descent as a visible simulation.** A loss surface is a landscape, each thing a point with `w = w - lr * grad(w)`. Sliders for learning rate, momentum and noise; compare runs. A good teaching tool.
+- **Toy networks as things and relations.** A few neurons with hand-written gradients: slow, but it shows learning step by step.
+- **Evolution and search.** Populations that mutate and get selected: optimisation without gradients, a natural fit for things and rules.
+- **A tokenizer** (BPE) is easy to write but is not a simulation; it would be a separate tool.
+
+**Where SimTara fits better**
+1. **Environments for AI agents.** A universe is a world an agent acts in through commands, with roles, scores and deterministic replay. SimTara is the arena; PyTorch or an API is the brain.
+2. **Evaluating agents.** Same universe, many agents and seeds, compare (branches and sweeps).
+3. **A language model as narrator or player** inside a story game; it describes or plays but never decides outcomes.
+4. **Optimising universe parameters** by search or finite-difference gradients across sweeps ("find the crew size that minimises burned area").
+
+## 7. More uses
+
+**Practical what-if tools**
+- **Policy and planning:** school closures in an epidemic, a new bus route, a bigger crew budget. Roles and limits already model who can do what and what runs out.
+- **Crowds, evacuation and traffic:** where to put an exit before building it.
+- **Supply chains and logistics:** "what if this port closes?"
+- **Economies and markets:** many agents with simple rules, for teaching and policy tests.
+- **Digital twin of a real system** (factory, server cluster, hospital) fed with real data for what-if runs.
+
+**Software and systems**
+- **Chaos testing for distributed systems:** servers, networks and failures simulated deterministically; a bug found with seed 4812 replays exactly.
+- **Game worlds:** a living world (weather, ecology, towns) that keeps running between sessions, so player changes last.
+
+**People and culture**
+- **Teaching kits:** a universe, controls to turn, and checks that grade predictions ("will the fire reach the town?", then run it).
+- **Competitions:** a fixed universe and goal; people or agents submit strategies; a leaderboard compares them. Determinism makes it fair.
+- **Interactive explainers:** an article embeds a universe in the browser; readers turn the controls (needs the web viewer).
+- **Generative art and music:** systems that grow and drift, rendered as images or video, with sound mapped from metrics.
+- **Wargaming and scenario planning:** roles for opposing sides, hidden information, a facilitator changing conditions mid-game.
+
+**Ecosystem**
+- **A marketplace** for paid universes and modules, with `.simtara` packages as the unit.
+- **More languages:** Python and others for modules and controllers, not only Luau.
+
+**Best near-term fit**
+1. Competitions and teaching: little new engineering (checks, packages, a leaderboard) and they build a community.
+2. Chaos testing for software: a market with money, matching the determinism the core already has.
+3. Policy and planning demos: good stories for people who do not write code.
