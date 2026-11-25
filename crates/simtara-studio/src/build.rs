@@ -175,7 +175,7 @@ end
 "##;
 
 /// (title, what it does, what to type)
-const REFERENCE: [(&str, &str, &str); 19] = [
+const REFERENCE: [(&str, &str, &str); 21] = [
     ("spawn", "Create a thing. Returns its id.", "local id = spawn{kind = \"person\", props = {age = 30, mood = \"calm\"}}"),
     ("despawn", "Remove a thing (and its relations).", "despawn(id)"),
     ("set", "Change properties of one thing.", "set{id = id, props = {age = 31}}"),
@@ -191,6 +191,8 @@ const REFERENCE: [(&str, &str, &str); 19] = [
     ("rule formulas", "Numbers, + - * / %, == != < > <= >=, and or not, if(c,a,b), min max abs sqrt floor clamp, random(), tick(), id, kind.", "when = \"energy < 1 and random() < 0.1\""),
     ("neighbours", "ncount(rel[,prop]) nsum nmean nmax nmin wsum wmean over the things this one points at.", "when = \"ncount(friend, knows) > 2\""),
     ("param", "A control you can turn while it runs. Rules use it by name like a property.", "param{name = \"spread\", value = 0.1, min = 0, max = 1, about = \"how contagious\"}"),
+    ("owner", "Who may change a control. Add owner = \"nature\" (or \"cat,dog\") to param{}; Studio's Play as menu locks the others.", "param{name = \"rain\", value = 0, min = 0, max = 1, owner = \"nature\"}"),
+    ("play_as", "Act as a role: only that role's controls can be changed. Empty = see and change all.", "play_as{role = \"firefighters\"}"),
     ("set_param", "Change a control from the script.", "set_param{name = \"spread\", value = 0.2}"),
     ("view", "How to draw things in the Universe tab. Each field names a property; links draws relations.", "view{x = \"x\", y = \"y\", color = \"heat\", size = \"mass\", links = true}"),
     ("random", "A repeatable random number 0..1 (never math.random).", "if random() < 0.5 then end"),
@@ -253,7 +255,9 @@ pub struct BuildView {
 fn make(seed: u64, script: &str, speed: f64) -> Simulation {
     let mut sim = simtara_store::build_simulation(&simtara_store::new_build_config(seed, script));
     sim.set_speed(speed);
-    sim.play();
+    // Start paused after setup() has built the world, so there is time to look and turn controls.
+    sim.advance(1);
+    sim.pause();
     sim
 }
 
@@ -304,7 +308,7 @@ impl BuildView {
         let (meta, snap) = store.load(name)?;
         let mut sim = simtara_store::build_simulation(&snap.config);
         sim.restore(&snap)?;
-        sim.play();
+        sim.pause();
         let script = simtara_script::source(sim.world());
         let mut v = BuildView::with(sim, snap.config.seed, script, meta.name.clone());
         v.saved_as = Some(meta.name.clone());
@@ -387,7 +391,11 @@ impl BuildView {
                 }
                 ui.separator();
                 let playing = self.sim.run_state() == RunState::Running;
-                if ui.button(if playing { "⏸ Pause" } else { "▶ Play" }).clicked() {
+                let fresh = self.sim.world().clock.tick <= 1;
+                let label = if playing { "⏸ Pause" } else if fresh { "▶ Start" } else { "▶ Play" };
+                let btn = egui::Button::new(label);
+                let btn = if fresh && !playing { btn.fill(egui::Color32::from_rgb(40, 130, 70)) } else { btn };
+                if ui.add(btn).clicked() {
                     self.sim.toggle();
                 }
                 if ui.add_enabled(!playing, egui::Button::new("⏭ Step")).clicked() {
@@ -507,14 +515,37 @@ impl BuildView {
             return;
         }
         let mut param_edits: Vec<(String, f64)> = Vec::new();
+        let mut role_edit: Option<String> = None;
+        let role = t.role.clone();
         if !t.params.is_empty() {
             egui::CollapsingHeader::new(format!("🎛 Controls ({})", t.params.len())).default_open(true).show(ui, |ui| {
+                let mut roles: Vec<String> = t.params.values().flat_map(|p| p.owner.split(',').map(|o| o.trim().to_string()).collect::<Vec<_>>()).filter(|o| !o.is_empty()).collect();
+                roles.sort();
+                roles.dedup();
+                if !roles.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("Play as");
+                        egui::ComboBox::from_id_salt("play_as").selected_text(if role.is_empty() { "everyone (see all)".to_string() } else { role.clone() }).show_ui(ui, |ui| {
+                            if ui.selectable_label(role.is_empty(), "everyone (see all)").clicked() {
+                                role_edit = Some(String::new());
+                            }
+                            for r in &roles {
+                                if ui.selectable_label(&role == r, r).clicked() {
+                                    role_edit = Some(r.clone());
+                                }
+                            }
+                        });
+                        ui.weak("Controls that belong to someone else are locked 🔒");
+                    });
+                }
                 egui::Grid::new("controls").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
                     for (name, p) in &t.params {
                         let mut v = p.value;
-                        ui.label(name).on_hover_text(&p.about);
+                        let mine = p.can_change(&role);
+                        let who = if p.owner.is_empty() { String::new() } else { format!("  [{}]", p.owner) };
+                        ui.label(format!("{}{}{}", if mine { "" } else { "🔒 " }, name, who)).on_hover_text(&p.about);
                         let step = (p.max - p.min) / 400.0;
-                        if ui.add(egui::Slider::new(&mut v, p.min..=p.max).step_by(step).custom_formatter(|n, _| fmt(n)).text(&p.about)).changed() {
+                        if ui.add_enabled(mine, egui::Slider::new(&mut v, p.min..=p.max).step_by(step).custom_formatter(|n, _| fmt(n)).text(&p.about)).changed() {
                             param_edits.push((name.clone(), v));
                         }
                         ui.end_row();
@@ -722,6 +753,9 @@ impl BuildView {
         painter.text(rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · {legend} · scroll to zoom, drag to move"), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
         self.pick = new_pick;
         self.show_links = Some(links_on);
+        if let Some(r) = role_edit {
+            let _ = self.sim.world_mut().call("play_as", &json!({"role": r}));
+        }
         for (name, value) in param_edits {
             let _ = self.sim.world_mut().call("set_param", &json!({"name": name, "value": value}));
         }
@@ -924,6 +958,7 @@ impl BuildView {
             let id = store.next_experiment_id(&name)?;
             let mut spec = simtara_store::new_script_spec(id, &self.exp_name, &self.exp_script, &self.exp_metric, self.exp_ticks);
             spec.param_overrides = self.exp_overrides.clone();
+            spec.role = self.sim.world().get::<Things>().map(|t| t.role.clone()).unwrap_or_default();
             if self.exp_name == DEFAULT_EXP_NAME && !self.exp_overrides.is_empty() {
                 let list: Vec<String> = self.exp_overrides.iter().map(|(k, v)| format!("{k} = {}", fmt(*v))).collect();
                 spec.name = list.join(", ");
@@ -1032,11 +1067,17 @@ impl BuildView {
         } else {
             ui.add_space(4.0);
             ui.strong("Change a control for the second run");
-            ui.weak("Tick the controls that should be different. The first run uses the script's own values.");
+            let role = self.sim.world().get::<Things>().map(|t| t.role.clone()).unwrap_or_default();
+            if role.is_empty() {
+                ui.weak("Tick the controls that should be different. The first run uses the script's own values.");
+            } else {
+                ui.weak(format!("You are playing '{role}': only your controls can be changed (🔒 = not yours). The first run uses the script's own values."));
+            }
             egui::Grid::new("exp_params").num_columns(3).spacing([14.0, 4.0]).show(ui, |ui| {
                 for (name, p) in &params {
                     let mut on = self.exp_overrides.contains_key(name);
-                    if ui.checkbox(&mut on, name).on_hover_text(&p.about).changed() {
+                    let mine = p.can_change(&role);
+                    if ui.add_enabled(mine, egui::Checkbox::new(&mut on, format!("{}{}", if mine { "" } else { "🔒 " }, name))).on_hover_text(&p.about).changed() {
                         if on {
                             self.exp_overrides.insert(name.clone(), p.value);
                         } else {

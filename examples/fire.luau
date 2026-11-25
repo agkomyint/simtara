@@ -3,17 +3,23 @@
 --   Burning uses up fuel and releases heat. Heat conducts to neighbours and leaks to the air.
 -- Turn the Controls while it runs: oxygen to 0 smothers the fire, rain cools and wets it,
 -- a low ignition temperature makes the forest explosive.
+-- Controls have owners: "nature" sets the conditions, "firefighters" are what a person can do.
+-- Use "Play as" to try the fire as the fire crew: only their controls can be moved.
 local N = 60
 
 function setup()
-  param{name = "ignite_temp", value = 180, min = 100, max = 600, about = "temperature where fuel starts to burn"}
-  param{name = "heat_release", value = 150, min = 0, max = 400, about = "heat given out per burning cell per tick"}
-  param{name = "burn_rate", value = 0.05, min = 0.005, max = 0.3, about = "fuel burnt per tick"}
-  param{name = "oxygen", value = 1.0, min = 0, max = 1, about = "0 = no air, nothing burns"}
-  param{name = "conduction", value = 0.25, min = 0, max = 0.5, about = "how fast heat moves to neighbours"}
-  param{name = "air_cooling", value = 0.03, min = 0, max = 0.3, about = "heat lost to the air"}
-  param{name = "rain", value = 0, min = 0, max = 1, about = "cools cells and puts fires out"}
-  param{name = "ambient", value = 20, min = 0, max = 40, about = "air temperature"}
+  param{name = "ignite_temp", value = 180, min = 100, max = 600, about = "temperature where fuel starts to burn", owner = "nature"}
+  param{name = "heat_release", value = 150, min = 0, max = 400, about = "heat given out per burning cell per tick", owner = "nature"}
+  param{name = "burn_rate", value = 0.05, min = 0.005, max = 0.3, about = "fuel burnt per tick", owner = "nature"}
+  param{name = "oxygen", value = 1.0, min = 0, max = 1, about = "0 = no air, nothing burns", owner = "nature"}
+  param{name = "conduction", value = 0.25, min = 0, max = 0.5, about = "how fast heat moves to neighbours", owner = "nature"}
+  param{name = "air_cooling", value = 0.03, min = 0, max = 0.3, about = "heat lost to the air", owner = "nature"}
+  param{name = "rain", value = 0, min = 0, max = 1, about = "cools cells and puts fires out", owner = "nature"}
+  param{name = "ambient", value = 20, min = 0, max = 40, about = "air temperature", owner = "nature"}
+
+  -- what the fire crew can do: spray water on burning cells, and clear fuel next to the fire
+  param{name = "water_drop", value = 0, min = 0, max = 5, about = "water sprayed on burning cells", owner = "firefighters"}
+  param{name = "fuel_clearing", value = 0, min = 0, max = 5, about = "fuel cleared near the fire (a firebreak)", owner = "firefighters"}
 
   local id = {}
   for gy = 0, N - 1 do
@@ -43,6 +49,9 @@ function setup()
   -- physics: conduction to neighbours, cooling to the air, rain
   add_rule{name = "heat_flow", kind = "cell", set = {
     temp = "max(ambient, temp + conduction * (nmean(next, temp) - temp) - air_cooling * (temp - ambient) - rain * 0.15 * (temp - ambient))"}}
+
+  add_rule{name = "water", kind = "cell", set = {temp = "max(ambient, temp - water_drop * 25 * burning)"}}
+  add_rule{name = "clear", kind = "cell", set = {fuel = "if(temp > 60 and burning < 1, max(0, fuel - fuel_clearing * 0.05), fuel)"}}
 
   define_metric{name = "cells burning", kind = "cell", prop = "burning", op = "sum"}
   define_metric{name = "fuel left", kind = "cell", prop = "fuel", op = "sum"}

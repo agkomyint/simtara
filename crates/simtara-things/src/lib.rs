@@ -69,6 +69,16 @@ pub struct Param {
     pub max: f64,
     #[serde(default)]
     pub about: String,
+    /// Who may change it: empty = anyone, otherwise role names separated by commas ("cat,dog", "nature").
+    #[serde(default)]
+    pub owner: String,
+}
+
+impl Param {
+    /// May someone playing `role` change this control? An empty role is the observer who may change everything.
+    pub fn can_change(&self, role: &str) -> bool {
+        role.is_empty() || self.owner.trim().is_empty() || self.owner.split(',').any(|o| o.trim() == role)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -80,6 +90,9 @@ pub struct Things {
     /// Values that win over what `param{...}` says (set by an experiment before the script's setup runs).
     #[serde(default)]
     pub overrides: BTreeMap<String, f64>,
+    /// The role being played ("" = observer who may change every control).
+    #[serde(default)]
+    pub role: String,
     next_id: u64,
     pub things: BTreeMap<u64, Thing>,
     pub relations: Vec<Relation>,
@@ -282,17 +295,35 @@ fn register_commands(w: &mut World) {
         let min = a.get("min").and_then(Value::as_f64).unwrap_or(0f64.min(value));
         let max = a.get("max").and_then(Value::as_f64).unwrap_or(if value > 0.0 { value * 2.0 } else { 1.0 });
         let about = a.get("about").and_then(Value::as_str).unwrap_or("").to_string();
+        let owner = a.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
         let t = things_mut(w)?;
         let value = t.overrides.get(&name).copied().unwrap_or(value);
-        t.params.insert(name, Param { value, min: min.min(value), max: max.max(value), about });
+        t.params.insert(name, Param { value, min: min.min(value), max: max.max(value), about, owner });
         Ok(json!(true))
     });
     w.register_command("set_param", |w, a| {
         let name = str_arg(a, "name")?;
         let value = a.get("value").and_then(Value::as_f64).ok_or("set_param needs a number value")?;
-        let p = things_mut(w)?.params.get_mut(name).ok_or_else(|| format!("no parameter named '{name}'; create it with param{{name=..., value=...}}"))?;
+        let t = things_mut(w)?;
+        let role = t.role.clone();
+        let p = t.params.get_mut(name).ok_or_else(|| format!("no parameter named '{name}'; create it with param{{name=..., value=...}}"))?;
+        if !p.can_change(&role) {
+            return Err(format!("as '{role}' you cannot change '{name}': it belongs to '{}'", p.owner));
+        }
         p.value = value;
         Ok(json!(value))
+    });
+    w.register_command("roles", |w, _| {
+        let t = things_mut(w)?;
+        let mut r: Vec<String> = t.params.values().flat_map(|p| p.owner.split(',').map(|o| o.trim().to_string()).collect::<Vec<_>>()).filter(|o| !o.is_empty()).collect();
+        r.sort();
+        r.dedup();
+        Ok(json!(r))
+    });
+    w.register_command("play_as", |w, a| {
+        let role = a.get("role").and_then(Value::as_str).unwrap_or("").to_string();
+        things_mut(w)?.role = role.clone();
+        Ok(json!(role))
     });
     w.register_command("get_param", |w, a| {
         let name = str_arg(a, "name")?;
@@ -547,5 +578,20 @@ mod tests {
         let v = s.world().get::<Things>().unwrap().things.values().next().unwrap().props["v"].as_f64().unwrap();
         assert_eq!(v, 23.0);
         assert!(s.world_mut().call("set_param", &json!({"name": "nope", "value": 1})).unwrap_err().contains("no parameter"));
+    }
+
+    #[test]
+    fn a_role_can_only_change_the_controls_it_owns() {
+        let mut s = sim();
+        let w = s.world_mut();
+        w.call("param", &json!({"name": "rain", "value": 0, "min": 0, "max": 1, "owner": "nature"})).unwrap();
+        w.call("param", &json!({"name": "dig", "value": 0, "min": 0, "max": 9, "owner": "cat,dog"})).unwrap();
+        assert_eq!(w.call("roles", &json!({})).unwrap(), json!(["cat", "dog", "nature"]));
+        w.call("play_as", &json!({"role": "dog"})).unwrap();
+        assert!(w.call("set_param", &json!({"name": "dig", "value": 3})).is_ok());
+        let e = w.call("set_param", &json!({"name": "rain", "value": 1})).unwrap_err();
+        assert!(e.contains("belongs to 'nature'"), "{e}");
+        w.call("play_as", &json!({"role": ""})).unwrap();
+        assert!(w.call("set_param", &json!({"name": "rain", "value": 1})).is_ok());
     }
 }

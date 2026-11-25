@@ -1034,6 +1034,13 @@ fn main() -> eframe::Result {
             Err(e) => notice = format!("could not open '{name}': {e}"),
         }
     }
+    // `simtara-studio --new fire --example fire` starts a new script universe from an example.
+    if let Some(name) = args.iter().position(|a| a == "--new").and_then(|i| args.get(i + 1)) {
+        let want = args.iter().position(|a| a == "--example").and_then(|i| args.get(i + 1)).map(|w| w.to_lowercase()).unwrap_or_default();
+        let idx = build::EXAMPLES.iter().position(|e| e.0.to_lowercase().contains(&want)).unwrap_or(0);
+        let name = if store.exists(name) { store.suggest_name() } else { name.clone() };
+        screen = Screen::Build(Box::new(build::BuildView::new(idx, 1, name)));
+    }
     let studio = Studio {
         launch: Launch { template: TEMPLATE_PARTICLES, count: 8000, kinds: 4, seed: 1, spread: 0.8, base: 0.0, use_gpu: g.available(), example: 1 },
         screen,

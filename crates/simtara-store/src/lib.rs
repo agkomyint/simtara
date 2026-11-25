@@ -79,6 +79,9 @@ pub struct ExperimentSpec {
     /// Controls (`param{...}`) set to different values in the changed run of a script universe.
     #[serde(default)]
     pub param_overrides: std::collections::BTreeMap<String, f64>,
+    /// Who is acting in the changed run; they may only change controls they own ("" = anyone).
+    #[serde(default)]
+    pub role: String,
     pub ticks: u64,
     pub sample_every: u64,
     pub metric: String,
@@ -399,6 +402,18 @@ fn arm_sim(start: &Snapshot, spec: &ExperimentSpec, value: f64, changed: bool) -
             _ => original.as_str(),
         };
         let mut sim = build_simulation(&new_build_config(start.config.seed, script));
+        if changed && !spec.role.is_empty() {
+            let known = from_snapshot(start)?;
+            if let Some(t) = known.world().get::<simtara_things::Things>() {
+                for name in spec.param_overrides.keys() {
+                    if let Some(p) = t.params.get(name) {
+                        if !p.can_change(&spec.role) {
+                            return Err(format!("as '{}' you cannot change '{name}': it belongs to '{}'", spec.role, p.owner));
+                        }
+                    }
+                }
+            }
+        }
         if changed {
             if let Some(t) = sim.world_mut().get_mut::<simtara_things::Things>() {
                 t.overrides = spec.param_overrides.clone();
@@ -478,6 +493,7 @@ pub fn new_spec(id: String, sim: &Simulation, parameter: &str, alt_value: f64, t
         alt_value,
         alt_script: None,
         param_overrides: Default::default(),
+        role: String::new(),
         ticks: ticks.max(1),
         sample_every: (ticks / 200).max(1),
         metric: DEFAULT_METRIC.to_string(),
@@ -496,6 +512,7 @@ pub fn new_script_spec(id: String, name: &str, script: &str, metric: &str, ticks
         alt_value: 0.0,
         alt_script: Some(script.to_string()),
         param_overrides: Default::default(),
+        role: String::new(),
         ticks: ticks.max(1),
         sample_every: (ticks / 200).max(1),
         metric: metric.to_string(),
@@ -747,6 +764,25 @@ end
         let r = run_experiment(&start, &spec).unwrap();
         assert_eq!(r.series[0].points.last().unwrap()[1], 10.0);
         assert_eq!(r.series[1].points.last().unwrap()[1], 30.0);
+    }
+
+    #[test]
+    fn an_experiment_refuses_a_control_the_role_does_not_own() {
+        let base = "function setup()
+  param{name = \"rain\", value = 0, min = 0, max = 1, owner = \"nature\"}
+  spawn{kind = \"p\", props = {v = 0}}
+  define_metric{name = \"v\", kind = \"p\", prop = \"v\", op = \"sum\"}
+end
+";
+        let mut sim = build_simulation(&new_build_config(1, base));
+        sim.advance(1);
+        let start = sim.snapshot().unwrap();
+        let mut spec = new_script_spec("e".into(), "rain", base, "v", 5);
+        spec.param_overrides.insert("rain".into(), 1.0);
+        spec.role = "firefighters".into();
+        assert!(run_experiment(&start, &spec).unwrap_err().contains("belongs to 'nature'"));
+        spec.role = "nature".into();
+        assert!(run_experiment(&start, &spec).is_ok());
     }
 
     #[test]
