@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Orbital gravity.** New `simtara-orbits` crate: Sun, Earth and Moon in real SI units, leapfrog integration, energy conserved. One tick = 6 hours, so 1461 ticks = one year. Studio gets a "Sun, Earth & Moon" template with follow/zoom view and trails.
+- **Lua event scripting.** New `simtara-script` crate: a sandboxed Lua script saved with the universe, `on_tick(t)` runs every tick (for example `remove_body("Moon")`). No files, network or randomness; runaway loops are stopped and reported. Modules expose actions through a new generic command registry in core (`World::register_command` / `call`).
+- **Script experiments.** An experiment can now change the script instead of a law ("What happens if the Moon disappears?"), and compare any measurement of the two runs.
 - **Save and reopen universes.** New `simtara-store` crate stores a universe as a folder (`universe.json` + `state.snap.json`, with a `schema_version`) under `Documents/SimTara/universes/` (override with `SIMTARA_HOME`). Studio launcher gets a "My universes" list (open, delete) and a Save button; leaving a saved universe autosaves it. `simtara-studio --open "<name>"` skips the launcher.
 - **Experiments.** In the Studio, change one law (gravity, friction, range, core repel, charge), run the original and the changed version from the same moment on CPU, and see a two-line chart. Results are saved with the universe (`experiment.json`, `results.json`, the exact `start.snap.json`, and a run record: engine version, seed, backend, time) and shown again on reopen.
 - `serde_json` now uses `float_roundtrip`, so saved numbers reload bit-for-bit (found by a test: results changed in the last digit after a save).

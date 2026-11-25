@@ -24,12 +24,22 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub const SCHEMA_VERSION: u32 = 1;
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TEMPLATE_PARTICLES: &str = "particles";
+pub const TEMPLATE_ORBITS: &str = "orbits";
 
 /// Parameters of the particles template that an experiment may change: (field, label).
 pub const PARAMETERS: [(&str, &str); 5] =
     [("gravity", "gravity"), ("friction", "friction"), ("rmax", "range"), ("repel_core", "core repel"), ("coulomb", "charge")];
 
 pub const DEFAULT_METRIC: &str = "particles.kinetic_energy";
+
+/// The metric an experiment charts unless told otherwise.
+pub fn default_metric(template: &str) -> &'static str {
+    if template == TEMPLATE_ORBITS {
+        "orbits.distance_km.Earth"
+    } else {
+        DEFAULT_METRIC
+    }
+}
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -52,10 +62,16 @@ pub struct ExperimentSpec {
     pub schema_version: u32,
     pub id: String,
     pub name: String,
-    /// Field name inside the template's laws, e.g. "gravity".
+    /// Field name inside the template's laws, e.g. "gravity". Empty for script experiments.
+    #[serde(default)]
     pub parameter: String,
+    #[serde(default)]
     pub base_value: f64,
+    #[serde(default)]
     pub alt_value: f64,
+    /// If set, the "changed" run uses this Lua script instead of the universe's own.
+    #[serde(default)]
+    pub alt_script: Option<String>,
     pub ticks: u64,
     pub sample_every: u64,
     pub metric: String,
@@ -95,11 +111,34 @@ pub struct Experiment {
 
 // ------------------------------------------------------------ building
 
-/// A fresh simulation of the particles template (CPU only; clients may add more modules).
+/// Which template a config describes.
+pub fn template_of(config: &Config) -> &'static str {
+    if config.modules.contains_key(simtara_orbits::MODULE) {
+        TEMPLATE_ORBITS
+    } else {
+        TEMPLATE_PARTICLES
+    }
+}
+
+/// A fresh simulation for whatever template the config describes (CPU only;
+/// clients may add more modules, such as the GPU backend).
 pub fn build_simulation(config: &Config) -> Simulation {
     let mut sim = Simulation::new(config.clone());
-    sim.add_module(simtara_particles::ParticleModule);
+    if template_of(config) == TEMPLATE_ORBITS {
+        sim.add_module(simtara_orbits::OrbitModule);
+        sim.add_module(simtara_script::ScriptModule);
+    } else {
+        sim.add_module(simtara_particles::ParticleModule);
+    }
     sim
+}
+
+/// A new orbits universe (Sun, Earth, Moon) with an empty-by-default script.
+pub fn new_orbits_config(seed: u64, script: &str) -> Config {
+    let mut config = Config { seed, ..Config::default() };
+    config.set_module(simtara_orbits::MODULE, &simtara_orbits::OrbitConfig::sun_earth_moon());
+    config.set_module(simtara_script::MODULE, &simtara_script::ScriptConfig { source: script.to_string() });
+    config
 }
 
 /// Rebuild a simulation exactly as it was when the snapshot was taken.
@@ -208,12 +247,15 @@ impl Store {
         let dir = self.dir(&name)?;
         let snap = sim.snapshot()?;
         let created = read_json::<UniverseMeta>(&dir.join("universe.json")).map(|m| m.created).unwrap_or_else(|_| now());
-        let count = sim.world().get::<simtara_particles::Particles>().map_or(0, |p| p.len());
+        let summary = match sim.world().get::<simtara_orbits::Bodies>() {
+            Some(b) => format!("{} bodies", b.list.len()),
+            None => format!("{} particles", sim.world().get::<simtara_particles::Particles>().map_or(0, |p| p.len())),
+        };
         let meta = UniverseMeta {
             schema_version: SCHEMA_VERSION,
             name,
             template: template.to_string(),
-            summary: format!("{count} particles"),
+            summary,
             seed: snap.config.seed,
             tick: snap.tick,
             created,
@@ -323,11 +365,15 @@ pub fn get_parameter(sim: &Simulation, field: &str) -> Option<f64> {
     serde_json::to_value(p).ok()?.get(field)?.as_f64()
 }
 
-fn run_arm(start: &Snapshot, spec: &ExperimentSpec, label: &str, value: f64) -> Result<Series, String> {
+fn run_arm(start: &Snapshot, spec: &ExperimentSpec, label: &str, value: f64, changed: bool) -> Result<Series, String> {
     let mut sim = from_snapshot(start)?;
     // CPU on purpose: CPU runs repeat exactly, GPU runs are only approximately repeatable.
     sim.compute_mut().set_requested(Backend::Cpu);
-    set_parameter(&mut sim, &spec.parameter, value)?;
+    match (&spec.alt_script, changed) {
+        (Some(script), true) => simtara_script::set_source(sim.world_mut(), script)?,
+        (Some(_), false) => {}
+        (None, _) => set_parameter(&mut sim, &spec.parameter, value)?,
+    }
     let every = spec.sample_every.max(1);
     let sample = |sim: &Simulation| -> Result<[f64; 2], String> {
         let v = *sim.collect_metrics().get(&spec.metric).ok_or_else(|| format!("unknown metric '{}'", spec.metric))?;
@@ -347,7 +393,7 @@ fn run_arm(start: &Snapshot, spec: &ExperimentSpec, label: &str, value: f64) -> 
 /// Run both arms (original value and changed value) from the same start state.
 pub fn run_experiment(start: &Snapshot, spec: &ExperimentSpec) -> Result<ExperimentResult, String> {
     let t0 = Instant::now();
-    let series = vec![run_arm(start, spec, "original", spec.base_value)?, run_arm(start, spec, "changed", spec.alt_value)?];
+    let series = vec![run_arm(start, spec, "original", spec.base_value, false)?, run_arm(start, spec, "changed", spec.alt_value, true)?];
     Ok(ExperimentResult {
         schema_version: SCHEMA_VERSION,
         series,
@@ -372,11 +418,29 @@ pub fn new_spec(id: String, sim: &Simulation, parameter: &str, alt_value: f64, t
         parameter: parameter.to_string(),
         base_value,
         alt_value,
+        alt_script: None,
         ticks: ticks.max(1),
         sample_every: (ticks / 200).max(1),
         metric: DEFAULT_METRIC.to_string(),
         created: now(),
     })
+}
+
+/// "Run this universe as it is, and again with this script": e.g. remove the Moon.
+pub fn new_script_spec(id: String, name: &str, script: &str, metric: &str, ticks: u64) -> ExperimentSpec {
+    ExperimentSpec {
+        schema_version: SCHEMA_VERSION,
+        id,
+        name: name.trim().to_string(),
+        parameter: String::new(),
+        base_value: 0.0,
+        alt_value: 0.0,
+        alt_script: Some(script.to_string()),
+        ticks: ticks.max(1),
+        sample_every: (ticks / 200).max(1),
+        metric: metric.to_string(),
+        created: now(),
+    }
 }
 
 #[cfg(test)]
@@ -491,5 +555,36 @@ mod tests {
     fn bad_parameters_are_rejected() {
         let mut sim = small_sim(1);
         assert!(set_parameter(&mut sim, "banana", 1.0).unwrap_err().contains("unknown parameter"));
+    }
+
+    #[test]
+    fn remove_the_moon_experiment_saves_reopens_and_differs() {
+        let store = temp_store("moon");
+        let mut sim = build_simulation(&new_orbits_config(1, "function on_tick(t) end"));
+        sim.advance(20);
+        let meta = store.save("Sun and Earth", &sim, TEMPLATE_ORBITS).unwrap();
+        assert_eq!(meta.template, TEMPLATE_ORBITS);
+        assert_eq!(meta.summary, "3 bodies");
+
+        let (_, snap) = store.load("Sun and Earth").unwrap();
+        assert_eq!(template_of(&snap.config), TEMPLATE_ORBITS);
+        let spec = new_script_spec(store.next_experiment_id("Sun and Earth").unwrap(), "Remove the Moon", "function on_tick(t) remove_body('Moon') end", "orbits.distance_km.Earth", 1461);
+        let result = run_experiment(&snap, &spec).unwrap();
+        let (a, b) = (&result.series[0], &result.series[1]);
+        assert_eq!(a.points.len(), b.points.len());
+        assert!(a.points.iter().zip(&b.points).any(|(p, q)| p[1] != q[1]), "removing the Moon should change Earth's path");
+        // Small next to the 150 million km orbit, but real: the Earth keeps its own ~12 m/s motion
+        // around the Earth-Moon centre of mass, so without the Moon it drifts onto a slightly
+        // different orbit (by how much depends on where the Moon was when it vanished).
+        let worst = a.points.iter().zip(&b.points).map(|(p, q)| (p[1] - q[1]).abs()).fold(0.0, f64::max);
+        assert!(worst > 1000.0 && worst < 500_000.0, "difference {worst} km");
+        // exact repeat
+        let again = run_experiment(&snap, &spec).unwrap();
+        assert_eq!(again.series[1].points, b.points);
+
+        store.save_experiment("Sun and Earth", &Experiment { spec, result }, &snap).unwrap();
+        let back = store.list_experiments("Sun and Earth");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].spec.alt_script.as_deref(), Some("function on_tick(t) remove_body('Moon') end"));
     }
 }

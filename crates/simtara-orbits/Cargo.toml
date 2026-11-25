@@ -1,0 +1,11 @@
+[package]
+name = "simtara-orbits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Orbital gravity module for SimTara: bodies pulling on each other (Sun, Earth, Moon, ...)"
+
+[dependencies]
+simtara-core = { path = "../simtara-core" }
+serde.workspace = true
+serde_json.workspace = true

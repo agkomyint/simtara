@@ -13,4 +13,6 @@ simtara-core = { path = "../simtara-core" }
 simtara-particles = { path = "../simtara-particles" }
 simtara-gpu = { path = "../simtara-gpu" }
 simtara-store = { path = "../simtara-store" }
+simtara-orbits = { path = "../simtara-orbits" }
+simtara-script = { path = "../simtara-script" }
 eframe = "0.37"

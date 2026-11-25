@@ -15,4 +15,4 @@ pub use compute::{Backend, Compute};
 pub use config::Config;
 pub use rng::Rng;
 pub use sim::{Builder, Context, MetricFn, Module, RunState, Simulation, Snapshot, Stage, System};
-pub use world::{Clock, ComponentStore, Entity, World};
+pub use world::{Clock, Command, ComponentStore, Entity, World};

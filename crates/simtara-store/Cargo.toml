@@ -8,5 +8,7 @@ description = "Saving and loading SimTara universes and experiments as folders o
 [dependencies]
 simtara-core = { path = "../simtara-core" }
 simtara-particles = { path = "../simtara-particles" }
+simtara-orbits = { path = "../simtara-orbits" }
+simtara-script = { path = "../simtara-script" }
 serde.workspace = true
 serde_json.workspace = true

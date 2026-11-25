@@ -105,7 +105,12 @@ pub struct World {
     resources: HashMap<TypeId, Boxed>,
     persistent: BTreeMap<String, Persistent>,
     events: HashMap<TypeId, Boxed>,
+    commands: BTreeMap<String, Command>,
 }
+
+/// A named action a module offers to the outside (scripts, the API, tools).
+/// Takes JSON in, gives JSON back, so the core stays ignorant of what it does.
+pub type Command = std::sync::Arc<dyn Fn(&mut World, &Value) -> Result<Value, String> + Send + Sync>;
 
 impl World {
     pub fn new() -> Self {
@@ -188,6 +193,19 @@ impl World {
     }
     pub fn clear_events(&mut self) {
         self.events.clear();
+    }
+
+    // ---- commands ----
+    /// Offer an action under `name` (convention: `verb_noun`, e.g. `remove_body`).
+    pub fn register_command(&mut self, name: &str, f: impl Fn(&mut World, &Value) -> Result<Value, String> + Send + Sync + 'static) {
+        self.commands.insert(name.to_string(), std::sync::Arc::new(f));
+    }
+    pub fn call(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        let c = self.commands.get(name).cloned().ok_or_else(|| format!("unknown command '{name}' (known: {})", self.command_names().join(", ")))?;
+        c(self, args)
+    }
+    pub fn command_names(&self) -> Vec<String> {
+        self.commands.keys().cloned().collect()
     }
 
     // ---- persistence ----
