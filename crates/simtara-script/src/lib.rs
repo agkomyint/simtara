@@ -22,7 +22,7 @@
 //! commands registered with `World::register_command`.
 
 use mlua::serde::SerializeOptions;
-use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, VmState};
+use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, VmState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use simtara_core::{Builder, Context, Module, Stage, System, World};
@@ -31,9 +31,8 @@ use std::sync::Arc;
 
 pub const MODULE: &str = "script";
 
-/// How many Lua instructions one call may use (about a millisecond or two of work per 100k).
+/// How many function calls and loop turns one call may use before it is stopped.
 const BUDGET: u64 = 2_000_000;
-const HOOK_EVERY: u32 = 1000;
 const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const LOG_KEEP: usize = 50;
 
@@ -74,8 +73,6 @@ pub fn status(world: &World) -> (Option<String>, Vec<String>) {
 }
 
 const PRELUDE: &str = r#"
-function call() error("call() only works while on_tick runs") end
-function log() end
 function remove_body(name) return call("remove_body", {name = name}) end
 function hide_body(name) return call("hide_body", {name = name}) end
 function show_body(name) return call("show_body", {name = name}) end
@@ -96,14 +93,14 @@ impl Runtime {
         lua.set_memory_limit(MEMORY_LIMIT).map_err(|e| e.to_string())?;
         let used = Arc::new(AtomicU64::new(0));
         let u = used.clone();
-        lua.set_hook(HookTriggers::new().every_nth_instruction(HOOK_EVERY), move |_, _| {
-            if u.fetch_add(HOOK_EVERY as u64, Ordering::Relaxed) > BUDGET {
+        // Luau calls this at every function call and loop turn.
+        lua.set_interrupt(move |_| {
+            if u.fetch_add(1, Ordering::Relaxed) > BUDGET {
                 Err(mlua::Error::runtime("script used too many steps in one tick (is there an endless loop?)"))
             } else {
                 Ok(VmState::Continue)
             }
-        })
-        .map_err(|e| e.to_string())?;
+        });
         let g = lua.globals();
         // No way out of the sandbox, and nothing that differs between runs.
         for name in ["dofile", "loadfile", "load", "loadstring", "require", "collectgarbage", "print"] {
@@ -114,10 +111,12 @@ impl Runtime {
                 m.set(name, LuaValue::Nil).map_err(|e| e.to_string())?;
             }
         }
+        // Luau's sandbox: the built-in libraries become read-only and the script gets its own globals.
+        lua.sandbox(true).map_err(|e| e.to_string())?;
         lua.load(PRELUDE).exec().map_err(|e| e.to_string())?;
         used.store(0, Ordering::Relaxed);
         lua.load(source).set_name("script").exec().map_err(|e| e.to_string())?;
-        let on_tick = g.get::<Option<mlua::Function>>("on_tick").map_err(|e| e.to_string())?;
+        let on_tick = lua.globals().get::<Option<mlua::Function>>("on_tick").map_err(|e| e.to_string())?;
         Ok(Runtime { lua, on_tick, used })
     }
 

@@ -3,13 +3,13 @@ name = "simtara-script"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Lua scripting for SimTara universes: events like 'at tick 5000 remove the Moon'"
+description = "Luau scripting for SimTara universes: events like 'at tick 5000 remove the Moon'"
 
 [dependencies]
 simtara-core = { path = "../simtara-core" }
 serde.workspace = true
 serde_json.workspace = true
-mlua = { version = "0.12", features = ["lua54", "vendored", "serialize", "send"] }
+mlua = { version = "0.12", features = ["luau", "serialize", "send"] }
 
 [dev-dependencies]
 simtara-orbits = { path = "../simtara-orbits" }

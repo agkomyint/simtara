@@ -1877,22 +1877,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
-name = "lua-src"
-version = "551.1.1"
+name = "luau0-src"
+version = "0.24.1+luau748"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc850974ab58b3b4bb65ac2415a077861a1c16b087629ee01cd04ccb9c82be61"
+checksum = "ab2f621c6f730cd6bce953ba86144e1c3acd1e7b4f0032bfac14d31ea2c9fb34"
 dependencies = [
  "cc",
-]
-
-[[package]]
-name = "luajit-src"
-version = "210.7.5+63c8f1a"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a98fb6f037124098f4c2283286a0431a4bb0b1d243b90ca1a4d34dd268ea5b96"
-dependencies = [
- "cc",
- "which",
 ]
 
 [[package]]
@@ -2011,8 +2001,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "libc",
- "lua-src",
- "luajit-src",
+ "luau0-src",
  "pkg-config",
 ]
 
@@ -4291,15 +4280,6 @@ dependencies = [
  "raw-window-handle",
  "static_assertions",
  "web-sys",
-]
-
-[[package]]
-name = "which"
-version = "8.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
-dependencies = [
- "libc",
 ]
 
 [[package]]
