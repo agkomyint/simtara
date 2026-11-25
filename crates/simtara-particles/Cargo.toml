@@ -1,0 +1,10 @@
+[package]
+name = "simtara-particles"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+simtara-core = { path = "../simtara-core" }
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true

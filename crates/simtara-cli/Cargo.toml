@@ -1,0 +1,15 @@
+[package]
+name = "simtara-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "simtara"
+path = "src/main.rs"
+
+[dependencies]
+simtara-core = { path = "../simtara-core" }
+simtara-particles = { path = "../simtara-particles" }
+serde_json.workspace = true
+minifb = "0.28"
+png = "0.17"
