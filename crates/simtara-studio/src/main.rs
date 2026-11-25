@@ -345,7 +345,7 @@ fn draw_chart(ui: &mut egui::Ui, exp: &Experiment) {
             }
         }
     });
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), (ui.available_height() - 24.0).max(80.0)), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 190.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 3.0, egui::Color32::from_gray(18));
     let all = exp.result.series.iter().flat_map(|s| s.points.iter());
     let (mut x0, mut x1, mut lo, mut hi) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
@@ -867,7 +867,7 @@ impl eframe::App for Studio {
 
                 if let Some(i) = run.selected {
                     let mut close = false;
-                    egui::Panel::bottom("results").min_size(230.0).show(ui, |ui| {
+                    egui::Panel::bottom("results").resizable(false).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.strong(format!("Experiment {} · {}", run.experiments[i].spec.id, run.experiments[i].spec.name));
                             if let (Some(script), Some(u)) = (&run.experiments[i].spec.alt_script, &run.saved_as) {
