@@ -15,10 +15,14 @@ const DEFAULT_SCRIPT: &str = "-- Runs once per tick. One tick = 6 hours, so 1461
 
 /// Starting text for the changed run of an orbits experiment.
 const EXPERIMENT_SCRIPT: &str = "-- The changed run uses this script instead of the universe's own.
+-- t is the universe's tick, so remember when this run began.
 -- hide_body: the Moon keeps moving but pulls on nothing. show_body brings it back.
 function on_tick(t)
-  if t == 0 then hide_body(\"Moon\") end
-  -- if t == 730 then show_body(\"Moon\") end
+  if not began then
+    began = t
+    hide_body(\"Moon\")
+  end
+  -- if t - began == 730 then show_body(\"Moon\") end
 end
 ";
 
@@ -356,13 +360,14 @@ fn draw_chart(ui: &mut egui::Ui, exp: &Experiment) {
             hi = lo + 1.0;
         }
         let plot = rect.shrink2(egui::vec2(56.0, 12.0));
-        for (s, c) in exp.result.series.iter().zip(colors) {
+        for (k, (s, c)) in exp.result.series.iter().zip(colors).enumerate() {
+            let width = if k == 0 { 4.0 } else { 1.5 };
             let pts: Vec<egui::Pos2> = s
                 .points
                 .iter()
                 .map(|p| egui::pos2(plot.left() + plot.width() * ((p[0] - x0) / (x1 - x0)) as f32, plot.bottom() - plot.height() * ((p[1] - lo) / (hi - lo)) as f32))
                 .collect();
-            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(2.0, c)));
+            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(width, c)));
         }
         let font = egui::FontId::proportional(11.0);
         let grey = egui::Color32::GRAY;
@@ -370,6 +375,27 @@ fn draw_chart(ui: &mut egui::Ui, exp: &Experiment) {
         ui.painter().text(egui::pos2(rect.left() + 4.0, plot.bottom()), egui::Align2::LEFT_BOTTOM, fmt_num(lo), font.clone(), grey);
         ui.painter().text(egui::pos2(plot.left(), rect.bottom() - 1.0), egui::Align2::LEFT_BOTTOM, format!("tick {x0:.0}"), font.clone(), grey);
         ui.painter().text(egui::pos2(plot.right(), rect.bottom() - 1.0), egui::Align2::RIGHT_BOTTOM, format!("tick {x1:.0}"), font, grey);
+    }
+    // The two runs are often nearly identical next to the size of the whole value, so show their difference on its own scale.
+    if let [orig, chg] = &exp.result.series[..] {
+        let diff: Vec<[f64; 2]> = orig.points.iter().zip(&chg.points).map(|(o, c)| [o[0], c[1] - o[1]]).collect();
+        let maxd = diff.iter().fold(0.0_f64, |m, d| m.max(d[1].abs()));
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, egui::Color32::from_gray(18));
+        let plot = rect.shrink2(egui::vec2(56.0, 6.0));
+        let mid = plot.center().y;
+        ui.painter().line_segment([egui::pos2(plot.left(), mid), egui::pos2(plot.right(), mid)], egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+        if diff.len() > 1 && maxd > 0.0 {
+            let n = (diff.len() - 1) as f32;
+            let pts: Vec<egui::Pos2> = diff.iter().enumerate().map(|(i, d)| egui::pos2(plot.left() + plot.width() * i as f32 / n, mid - (plot.height() / 2.0) * (d[1] / maxd) as f32)).collect();
+            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 120, 120))));
+        }
+        let grey = egui::Color32::GRAY;
+        ui.painter().text(egui::pos2(rect.left() + 4.0, rect.top() + 4.0), egui::Align2::LEFT_TOP, format!("+{}", fmt_num(maxd)), egui::FontId::proportional(11.0), grey);
+        if maxd == 0.0 {
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "no difference between the two runs: does the script actually do anything in this run?", egui::FontId::proportional(12.0), egui::Color32::LIGHT_RED);
+        }
+        ui.weak("difference: changed minus original");
     }
     let r = &exp.result.record;
     ui.weak(format!("metric {} · engine v{} · seed {} · {} · {} ms", exp.spec.metric, r.engine_version, r.seed, r.backend, r.millis));
