@@ -9,3 +9,4 @@ description = "Domain-neutral things for SimTara: kinds, properties, relations a
 simtara-core = { path = "../simtara-core" }
 serde.workspace = true
 serde_json.workspace = true
+rayon.workspace = true

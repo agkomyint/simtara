@@ -11,11 +11,16 @@
 //! `things {kind?}`, `count {kind?}`, `relate {from, to, kind, weight?}`,
 //! `unrelate {from, to, kind?}`, `related {id, kind?}`,
 //! `define_metric {name, kind, prop?, op}` (op: count, sum, mean, min, max),
-//! `random {}` (0..1, repeatable from the universe seed).
+//! `set_all {kind, props}`, `random {}` (0..1, repeatable from the universe seed), and rules that
+//! run natively on every thing of a kind each tick: `add_rule {name, kind, when?, set?, remove_when?, every?}`,
+//! `remove_rule {name}`, `enable_rule {name, on?}`, `rules` (see `rules.rs` for the formula language).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use simtara_core::{Builder, Module, World};
+mod rules;
+pub use rules::{compile, Rule};
+
+use simtara_core::{Builder, Context, Module, Stage, System, World};
 use std::collections::BTreeMap;
 
 pub const MODULE: &str = "things";
@@ -50,18 +55,15 @@ pub struct Things {
     pub things: BTreeMap<u64, Thing>,
     pub relations: Vec<Relation>,
     pub metrics: Vec<MetricDef>,
+    pub rules: Vec<Rule>,
+    #[serde(skip)]
+    compiled: std::collections::HashMap<String, std::sync::Arc<rules::Compiled>>,
     rng: u64,
 }
 
 impl Things {
     fn random(&mut self) -> f64 {
-        // splitmix64: tiny, repeatable, and its state is one number that snapshots save.
-        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        (z >> 11) as f64 / (1u64 << 53) as f64
+        rules::unit_random(&mut self.rng)
     }
 
     pub fn of_kind<'a>(&'a self, kind: Option<&'a str>) -> impl Iterator<Item = &'a Thing> {
@@ -96,6 +98,20 @@ fn as_number(v: &Value) -> Option<f64> {
     }
 }
 
+struct RuleSystem;
+
+impl System for RuleSystem {
+    fn name(&self) -> &str {
+        "things.rules"
+    }
+    fn run(&mut self, ctx: &mut Context) {
+        if let Some(mut t) = ctx.world.take::<Things>() {
+            t.run_rules(ctx.tick);
+            ctx.world.put(t);
+        }
+    }
+}
+
 pub struct ThingsModule;
 
 impl Module for ThingsModule {
@@ -105,6 +121,7 @@ impl Module for ThingsModule {
     fn build(&self, b: &mut Builder) {
         b.world.insert_persistent("things", Things { rng: b.config.seed, ..Things::default() });
         register_commands(b.world);
+        b.add_system(Stage::Update, RuleSystem);
         b.add_metric("things.total", |w| w.get::<Things>().map_or(0.0, |t| t.things.len() as f64));
         b.add_metric_source(|w| {
             let Some(t) = w.get::<Things>() else { return Vec::new() };
@@ -246,6 +263,75 @@ fn register_commands(w: &mut World) {
         t.metrics.push(MetricDef { name, kind, prop, op });
         Ok(json!(true))
     });
+    w.register_command("add_rule", |w, a| {
+        let name = str_arg(a, "name")?.to_string();
+        let kind = str_arg(a, "kind")?.to_string();
+        let text = |key: &str| -> Result<Option<String>, String> {
+            match a.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.clone())),
+                Some(_) => Err(format!("'{key}' must be a formula in quotes, e.g. {key} = \"age > 90\"")),
+            }
+        };
+        let mut set = BTreeMap::new();
+        match a.get("set") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(m)) => {
+                for (k, v) in m {
+                    let f = match v {
+                        Value::String(f) => f.clone(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => return Err(format!("set.{k} must be a formula in quotes, e.g. {k} = \"{k} + 1\"")),
+                    };
+                    set.insert(k.clone(), f);
+                }
+            }
+            Some(_) => return Err("'set' must be a table like {age = \"age + 1\"}".into()),
+        }
+        let every = a.get("every").and_then(Value::as_u64).unwrap_or(1).max(1);
+        let rule = Rule { name, kind, when: text("when")?, set, remove_when: text("remove_when")?, every, enabled: true, error: None };
+        things_mut(w)?.add_rule(rule)?;
+        Ok(json!(true))
+    });
+    w.register_command("remove_rule", |w, a| {
+        let name = str_arg(a, "name")?;
+        let t = things_mut(w)?;
+        let before = t.rules.len();
+        t.rules.retain(|r| r.name != name);
+        Ok(json!(t.rules.len() < before))
+    });
+    w.register_command("enable_rule", |w, a| {
+        let name = str_arg(a, "name")?;
+        let on = a.get("on").and_then(Value::as_bool).unwrap_or(true);
+        let t = things_mut(w)?;
+        let r = t.rules.iter_mut().find(|r| r.name == name).ok_or_else(|| format!("no rule named '{name}'"))?;
+        r.enabled = on;
+        if on {
+            r.error = None;
+        }
+        Ok(json!(true))
+    });
+    w.register_command("rules", |w, _| {
+        let t = things_mut(w)?;
+        Ok(Value::Array(
+            t.rules
+                .iter()
+                .map(|r| json!({"name": r.name, "kind": r.kind, "when": r.when, "set": r.set, "remove_when": r.remove_when, "every": r.every, "enabled": r.enabled, "error": r.error}))
+                .collect(),
+        ))
+    });
+    w.register_command("set_all", |w, a| {
+        let kind = str_arg(a, "kind")?.to_string();
+        let props = props_of(a)?;
+        let t = things_mut(w)?;
+        let mut n = 0;
+        for th in t.things.values_mut().filter(|x| x.kind == kind) {
+            th.props.extend(props.clone());
+            n += 1;
+        }
+        Ok(json!(n))
+    });
     w.register_command("random", |w, _| Ok(json!(things_mut(w)?.random())));
 }
 
@@ -299,5 +385,81 @@ mod tests {
         let next = draw(&mut a);
         a.restore(&snap).unwrap();
         assert_eq!(draw(&mut a), next);
+    }
+
+    fn rule(w: &mut World, v: Value) -> Result<Value, String> {
+        w.call("add_rule", &v)
+    }
+
+    #[test]
+    fn rules_update_everything_together_and_explain_mistakes() {
+        let mut s = sim();
+        let w = s.world_mut();
+        for age in [1, 50, 89] {
+            w.call("spawn", &json!({"kind": "person", "props": {"age": age}})).unwrap();
+        }
+        rule(w, json!({"name": "age", "kind": "person", "set": {"age": "age + 1"}, "remove_when": "age > 90"})).unwrap();
+        w.call("define_metric", &json!({"name": "mean_age", "kind": "person", "prop": "age", "op": "mean"})).unwrap();
+        s.advance(1);
+        assert_eq!(s.collect_metrics()["mean_age"], (2.0 + 51.0 + 90.0) / 3.0);
+        s.advance(2);
+        assert_eq!(s.collect_metrics()["things.count.person"], 2.0, "the oldest left");
+        let w = s.world_mut();
+        assert!(rule(w, json!({"name": "bad", "kind": "x", "set": {"a": "age +"}})).unwrap_err().contains("age +"));
+        assert!(rule(w, json!({"name": "bad", "kind": "x", "set": {"a": "nope(1)"}})).unwrap_err().contains("unknown function"));
+        assert!(rule(w, json!({"name": "bad", "kind": "x"})).is_err());
+    }
+
+    #[test]
+    fn neighbours_drive_rules_and_rules_can_be_switched_off() {
+        let mut s = sim();
+        let w = s.world_mut();
+        let ids: Vec<u64> = (0..3).map(|i| w.call("spawn", &json!({"kind": "p", "props": {"v": if i == 0 { 10.0 } else { 0.0 }}})).unwrap().as_u64().unwrap()).collect();
+        w.call("relate", &json!({"from": ids[1], "to": ids[0], "kind": "near"})).unwrap();
+        w.call("relate", &json!({"from": ids[2], "to": ids[1], "kind": "near"})).unwrap();
+        rule(w, json!({"name": "flow", "kind": "p", "when": "ncount(near) > 0", "set": {"v": "nmean(near, v)"}})).unwrap();
+        s.advance(1);
+        let v = |s: &Simulation, i: usize| s.world().get::<Things>().unwrap().things[&ids[i]].props["v"].as_f64().unwrap();
+        assert_eq!((v(&s, 0), v(&s, 1), v(&s, 2)), (10.0, 10.0, 0.0), "synchronous: 2 saw the old value of 1");
+        s.world_mut().call("enable_rule", &json!({"name": "flow", "on": false})).unwrap();
+        s.advance(5);
+        assert_eq!(v(&s, 2), 0.0, "switched off, nothing moves");
+        s.world_mut().call("enable_rule", &json!({"name": "flow"})).unwrap();
+        s.advance(1);
+        assert_eq!(v(&s, 2), 10.0);
+    }
+
+    #[test]
+    fn a_rule_that_breaks_turns_itself_off_and_says_why() {
+        let mut s = sim();
+        let w = s.world_mut();
+        w.call("spawn", &json!({"kind": "p", "props": {"v": 1.0}})).unwrap();
+        rule(w, json!({"name": "div", "kind": "p", "set": {"v": "1 / (v - 1)"}})).unwrap();
+        s.advance(2);
+        let r = s.world_mut().call("rules", &json!({})).unwrap();
+        assert_eq!(r[0]["enabled"], json!(false));
+        assert!(r[0]["error"].as_str().unwrap().contains("division by zero"));
+    }
+
+    #[test]
+    fn a_hundred_thousand_things_with_random_rules_repeat_exactly() {
+        let build = || {
+            let mut s = sim();
+            let w = s.world_mut();
+            for i in 0..100_000 {
+                w.call("spawn", &json!({"kind": "c", "props": {"e": (i % 7) as f64, "alive": true}})).unwrap();
+            }
+            rule(w, json!({"name": "drift", "kind": "c", "set": {"e": "e * 0.99 + random()"}, "remove_when": "random() < 0.001"})).unwrap();
+            s
+        };
+        let (mut a, mut b) = (build(), build());
+        let t0 = std::time::Instant::now();
+        a.advance(5);
+        let took = t0.elapsed();
+        b.advance(5);
+        assert_eq!(a.snapshot().unwrap().state, b.snapshot().unwrap().state);
+        let n = a.collect_metrics()["things.count.c"];
+        assert!(n < 100_000.0 && n > 99_000.0, "{n}");
+        eprintln!("100k things x 5 ticks: {took:?}");
     }
 }

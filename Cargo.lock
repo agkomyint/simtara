@@ -3269,6 +3269,7 @@ dependencies = [
 name = "simtara-things"
 version = "0.2.0"
 dependencies = [
+ "rayon",
  "serde",
  "serde_json",
  "simtara-core",
