@@ -98,3 +98,24 @@ Ideas that fit SimTara's design but are not built yet. Each says what already ex
 - *Twin*: a branch that keeps following the main universe with a persistent difference; later.
 
 **Open question.** Text-and-choices or a visual (3D) world? That decides the amount of player-view work more than anything else.
+
+## 5. Science use
+
+**Perturbation modeling: a natural fit.** A perturbation study is a baseline run, one change, and a comparison. That is already the experiment feature: gene knockout, drug dose, temperature change, removing a species, crew size in the fire example. Determinism, same-seed branches, compare charts and sweeps are what make such a study trustworthy.
+
+Needed to make it a real study tool:
+- Sensitivity analysis: sweep many controls and rank which matter most.
+- Many seeds, with uncertainty ranges instead of one line.
+- Fitting controls to measured data (CSV in, parameters out).
+- Reproducible `.simtara` packages, so a result can be rerun and checked.
+
+**Protein folding: a stretch.** Real folding simulation is molecular dynamics: force fields, tiny timesteps, neighbour lists, long-range forces, GPU kernels, validated over decades (GROMACS, OpenMM). SimTara's particles module and GPU backend are nowhere near that, and validation is a research effort of its own. AlphaFold-style prediction is machine learning, not simulation. Realistic near-term uses are toy and teaching models: coarse-grained chains, HP lattice folding, "what if this bond is stronger?".
+
+**What science needs in the platform**
+1. Numerical methods: ODE solvers, stochastic simulation (Gillespie), proper integrators, not only per-tick rules.
+2. Units and dimensions, so a model cannot mix metres and seconds.
+3. Performance: bulk spawn, spatial queries, columnar storage, GPU rules.
+4. Data in and out: CSV and standard formats.
+5. Validation: each science module must reproduce a known result and ship with that test.
+
+**Honest framing.** SimTara is a platform, not a model. Scientific value comes from each module's correctness. The claim to make is "reproducible, comparable what-if experiments for models people build", not "discovers things". A fast, clear loop for building and testing models is a real contribution; the discovery comes from the model and its data.
