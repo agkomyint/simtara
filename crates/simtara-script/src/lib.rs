@@ -77,6 +77,8 @@ const PRELUDE: &str = r#"
 function call() error("call() only works while on_tick runs") end
 function log() end
 function remove_body(name) return call("remove_body", {name = name}) end
+function hide_body(name) return call("hide_body", {name = name}) end
+function show_body(name) return call("show_body", {name = name}) end
 function set_mass(name, mass) return call("set_mass", {name = name, mass = mass}) end
 function body(name) return call("body", {name = name}) end
 function bodies() return call("bodies") end
@@ -227,6 +229,18 @@ mod tests {
         assert_eq!(bodies(&sim), 3, "not yet");
         sim.advance(1);
         assert_eq!(bodies(&sim), 2, "removed at tick 50");
+        assert!(status(sim.world()).0.is_none());
+    }
+
+    #[test]
+    fn a_hidden_body_can_be_brought_back() {
+        let src = "function on_tick(t) if t == 10 then hide_body('Moon') end if t == 200 then show_body('Moon') end end";
+        let mut sim = universe(src);
+        sim.advance(50);
+        assert_eq!(sim.collect_metrics()["orbits.bodies"], 2.0);
+        assert_eq!(bodies(&sim), 3, "still there, just not pulling");
+        sim.advance(200);
+        assert_eq!(sim.collect_metrics()["orbits.bodies"], 3.0);
         assert!(status(sim.world()).0.is_none());
     }
 

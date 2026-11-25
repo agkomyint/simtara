@@ -14,7 +14,13 @@ use std::sync::mpsc::{channel, Receiver};
 const DEFAULT_SCRIPT: &str = "-- Runs once per tick. One tick = 6 hours, so 1461 ticks = one year.\n-- Try: remove the Moon after a year (delete the two dashes in front of 'if').\nfunction on_tick(t)\n  -- if t == 1461 then remove_body(\"Moon\") end\nend\n";
 
 /// Starting text for the changed run of an orbits experiment.
-const EXPERIMENT_SCRIPT: &str = "-- The changed run uses this script instead of the universe's own.\n-- Here: the Moon vanishes at the start of the run.\nfunction on_tick(t)\n  remove_body(\"Moon\")\nend\n";
+const EXPERIMENT_SCRIPT: &str = "-- The changed run uses this script instead of the universe's own.
+-- hide_body: the Moon keeps moving but pulls on nothing. show_body brings it back.
+function on_tick(t)
+  if t == 0 then hide_body(\"Moon\") end
+  -- if t == 730 then show_body(\"Moon\") end
+end
+";
 
 const VIEW: usize = 900;
 
@@ -411,7 +417,7 @@ fn orbit_controls(ui: &mut egui::Ui, run: &mut Running) {
     });
     ui.separator();
     ui.strong("Script (Lua)");
-    ui.weak("on_tick(t) runs every tick. Commands: remove_body(name), set_mass(name, kg), body(name), log(...)");
+    ui.weak("on_tick(t) runs every tick. Commands: hide_body(name), show_body(name), remove_body(name), set_mass(name, kg), body(name), log(...)");
     ui.add(egui::TextEdit::multiline(&mut run.script_text).code_editor().desired_rows(8).desired_width(f32::INFINITY));
     let applied = simtara_script::source(run.sim.world());
     ui.horizontal(|ui| {
@@ -463,8 +469,12 @@ fn draw_orbits(ui: &mut egui::Ui, run: &mut Running) {
     for body in &b.list {
         let p = to_screen([body.pos[0] - origin[0], body.pos[1] - origin[1]]);
         let r = ((body.radius * scale) as f32).clamp(3.0, 400.0);
-        painter.circle_filled(p, r, color(body.color));
-        painter.text(p + egui::vec2(r + 4.0, -r - 2.0), egui::Align2::LEFT_BOTTOM, &body.name, egui::FontId::proportional(13.0), egui::Color32::from_gray(190));
+        if body.hidden {
+            painter.circle_stroke(p, r, egui::Stroke::new(1.0, color(body.color).gamma_multiply(0.5)));
+        } else {
+            painter.circle_filled(p, r, color(body.color));
+        }
+        painter.text(p + egui::vec2(r + 4.0, -r - 2.0), egui::Align2::LEFT_BOTTOM, if body.hidden { format!("{} (hidden)", body.name) } else { body.name.clone() }, egui::FontId::proportional(13.0), egui::Color32::from_gray(190));
     }
     painter.text(
         rect.left_bottom() + egui::vec2(10.0, -10.0),
@@ -498,83 +508,118 @@ impl eframe::App for Studio {
                 let mut go = false;
                 let mut open: Option<String> = None;
                 let mut delete: Option<String> = None;
-                egui::CentralPanel::default().show(ui, |ui| {
+                let accent = egui::Color32::from_rgb(90, 150, 255);
+                egui::Panel::left("saved_universes").min_size(320.0).show(ui, |ui| {
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("SimTara").size(28.0).strong());
+                    ui.weak("Build a universe. Change one thing. See what happens.");
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("My universes").size(16.0).strong());
+                    ui.add_space(6.0);
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add_space(20.0);
-                        ui.heading("SimTara");
-
-                        ui.add_space(8.0);
-                        ui.strong("My universes");
                         if self.saved.is_empty() {
-                            ui.weak("Nothing saved yet. Launch a universe below, then press Save.");
+                            ui.weak("Nothing saved yet. Launch a universe, then press Save.");
                         }
                         for m in &self.saved {
-                            ui.horizontal(|ui| {
-                                if ui.button("Open").clicked() {
-                                    open = Some(m.name.clone());
-                                }
-                                ui.strong(&m.name);
-                                ui.weak(format!("{} · tick {} · saved {}", m.summary, m.tick, age(m.updated)));
-                                if self.confirm_delete.as_deref() == Some(m.name.as_str()) {
-                                    ui.colored_label(egui::Color32::LIGHT_RED, "Delete for good?");
-                                    if ui.button("Yes, delete").clicked() {
-                                        delete = Some(m.name.clone());
+                            egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(egui::RichText::new(&m.name).strong().size(15.0));
+                                ui.weak(format!("{} · tick {} · {}", m.summary, m.tick, age(m.updated)));
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    if ui.add(egui::Button::new("Open").fill(accent.gamma_multiply(0.5))).clicked() {
+                                        open = Some(m.name.clone());
                                     }
-                                    if ui.button("No").clicked() {
-                                        self.confirm_delete = None;
+                                    if self.confirm_delete.as_deref() == Some(m.name.as_str()) {
+                                        ui.colored_label(egui::Color32::LIGHT_RED, "Delete?");
+                                        if ui.small_button("Yes").clicked() {
+                                            delete = Some(m.name.clone());
+                                        }
+                                        if ui.small_button("No").clicked() {
+                                            self.confirm_delete = None;
+                                        }
+                                    } else if ui.small_button("Delete").clicked() {
+                                        self.confirm_delete = Some(m.name.clone());
                                     }
-                                } else if ui.small_button("Delete").clicked() {
-                                    self.confirm_delete = Some(m.name.clone());
-                                }
+                                });
                             });
+                            ui.add_space(4.0);
                         }
                         if !self.notice.is_empty() {
                             ui.colored_label(egui::Color32::LIGHT_RED, &self.notice);
                         }
+                        ui.add_space(8.0);
                         ui.weak(format!("Saved in {}", self.store.root().display()));
-
-                        ui.add_space(16.0);
-                        ui.separator();
+                    });
+                });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new("New universe").size(22.0).strong());
+                        ui.weak("1 · Pick a template");
                         ui.add_space(8.0);
-                        ui.strong("New universe");
-                        ui.label("Choose the starting conditions, then launch.");
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.launch.template, TEMPLATE_PARTICLES, "Particle life");
-                            ui.selectable_value(&mut self.launch.template, TEMPLATE_ORBITS, "Sun, Earth & Moon");
+                        let cards = [
+                            (TEMPLATE_PARTICLES, "Particle life", "Thousands of coloured particles that attract and repel. Watch life-like patterns appear. Runs on CPU or GPU."),
+                            (TEMPLATE_ORBITS, "Sun, Earth & Moon", "Real gravity with real masses and distances. Script events in Lua, like making the Moon vanish."),
+                        ];
+                        ui.columns(2, |cols| {
+                            for (i, (id, title, text)) in cards.iter().enumerate() {
+                                let selected = self.launch.template == *id;
+                                let stroke = if selected { egui::Stroke::new(2.0, accent) } else { egui::Stroke::new(1.0, egui::Color32::from_gray(70)) };
+                                let r = egui::Frame::new().stroke(stroke).corner_radius(8.0).inner_margin(14.0).fill(if selected { accent.gamma_multiply(0.12) } else { egui::Color32::TRANSPARENT }).show(&mut cols[i], |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.set_min_height(90.0);
+                                    ui.label(egui::RichText::new(*title).strong().size(16.0));
+                                    ui.add_space(4.0);
+                                    ui.label(*text);
+                                });
+                                let click = cols[i].interact(r.response.rect, egui::Id::new(("card", i)), egui::Sense::click());
+                                if click.clicked() {
+                                    self.launch.template = id;
+                                }
+                                if click.hovered() {
+                                    cols[i].ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                            }
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(18.0);
+                        ui.weak("2 · Starting conditions");
+                        ui.add_space(8.0);
                         let l = &mut self.launch;
-                        if l.template == TEMPLATE_ORBITS {
-                            ui.label("Real masses and distances in real physics. One tick is 6 hours, so 1461 ticks is one year.");
-                            ui.label("Write a Lua script to make things happen (for example the Moon vanishes), then run an experiment to compare.");
-                        } else {
-                        egui::Grid::new("launch").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-                            ui.label("Particles");
-                            ui.add(egui::Slider::new(&mut l.count, 500..=100_000).logarithmic(true));
-                            ui.end_row();
-                            ui.label("Kinds (colours)");
-                            ui.add(egui::Slider::new(&mut l.kinds, 2..=8));
-                            ui.end_row();
-                            ui.label("Seed");
-                            ui.add(egui::DragValue::new(&mut l.seed));
-                            ui.end_row();
-                            ui.label("Spread");
-                            ui.add(egui::Slider::new(&mut l.spread, 0.0..=2.0));
-                            ui.end_row();
-                            ui.label("Base attraction");
-                            ui.add(egui::Slider::new(&mut l.base, -1.0..=1.0));
-                            ui.end_row();
-                            ui.label("Compute");
-                            ui.horizontal(|ui| {
-                                ui.add_enabled(self.gpu_ok, egui::Checkbox::new(&mut l.use_gpu, "GPU"));
-                                ui.weak(&self.gpu_desc);
-                            });
-                            ui.end_row();
+                        egui::Frame::group(ui.style()).inner_margin(14.0).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if l.template == TEMPLATE_ORBITS {
+                                ui.label("Sun, Earth and Moon start in their real orbits. One tick is 6 hours, so 1461 ticks is one year.");
+                                ui.add_space(4.0);
+                                ui.weak("Once inside, write a Lua script and run an experiment to compare two versions.");
+                            } else {
+                                egui::Grid::new("launch").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+                                    ui.label("Particles");
+                                    ui.add(egui::Slider::new(&mut l.count, 500..=100_000).logarithmic(true));
+                                    ui.end_row();
+                                    ui.label("Kinds (colours)");
+                                    ui.add(egui::Slider::new(&mut l.kinds, 2..=8));
+                                    ui.end_row();
+                                    ui.label("Seed");
+                                    ui.add(egui::DragValue::new(&mut l.seed));
+                                    ui.end_row();
+                                    ui.label("Spread");
+                                    ui.add(egui::Slider::new(&mut l.spread, 0.0..=2.0));
+                                    ui.end_row();
+                                    ui.label("Base attraction");
+                                    ui.add(egui::Slider::new(&mut l.base, -1.0..=1.0));
+                                    ui.end_row();
+                                    ui.label("Compute");
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled(self.gpu_ok, egui::Checkbox::new(&mut l.use_gpu, "GPU"));
+                                        ui.weak(&self.gpu_desc);
+                                    });
+                                    ui.end_row();
+                                });
+                            }
                         });
-                        }
                         ui.add_space(20.0);
-                        if ui.add(egui::Button::new("Launch universe").min_size(egui::vec2(180.0, 36.0))).clicked() {
+                        if ui.add(egui::Button::new(egui::RichText::new("▶  Launch universe").size(17.0).strong()).fill(accent.gamma_multiply(0.6)).min_size(egui::vec2(240.0, 44.0))).clicked() {
                             go = true;
                         }
                     });
@@ -605,6 +650,7 @@ impl eframe::App for Studio {
                 let mut back = false;
                 let mut do_save = false;
                 let mut do_experiment = false;
+                let mut branch: Option<(String, String, String)> = None;
                 run.poll_experiment(&self.store);
 
                 egui::Panel::left("controls").min_size(300.0).show(ui, |ui| {
@@ -798,6 +844,11 @@ impl eframe::App for Studio {
                     egui::Panel::bottom("results").min_size(230.0).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.strong(format!("Experiment {} · {}", run.experiments[i].spec.id, run.experiments[i].spec.name));
+                            if let (Some(script), Some(u)) = (&run.experiments[i].spec.alt_script, &run.saved_as) {
+                                if ui.button("➕ Keep the changed version as a new universe").clicked() {
+                                    branch = Some((u.clone(), run.experiments[i].spec.id.clone(), script.clone()));
+                                }
+                            }
                             if ui.small_button("✕ close").clicked() {
                                 close = true;
                             }
@@ -831,7 +882,26 @@ impl eframe::App for Studio {
                     });
                 }
                 ctx.request_repaint();
-                if back {
+                if let Some((universe, id, script)) = branch {
+                    let made = (|| -> Result<Running, String> {
+                        let snap = self.store.load_experiment_start(&universe, &id)?;
+                        let mut sim = simtara_store::from_snapshot(&snap)?;
+                        simtara_script::set_source(sim.world_mut(), &script)?;
+                        sim.set_speed(3.0);
+                        sim.play();
+                        let mut r = Running::fresh(sim, ParticleConfig::default(), snap.config.seed, GpuModule::new(), self.store.suggest_name(), TEMPLATE_ORBITS, snap.config.clone());
+                        r.status = format!("new universe from experiment {id} of '{universe}'. Press Save to keep it.");
+                        Ok(r)
+                    })();
+                    match made {
+                        Ok(r) => {
+                            self.autosave();
+                            self.screen = Screen::Universe(Box::new(r));
+                            self.refresh();
+                        }
+                        Err(e) => self.notice = e,
+                    }
+                } else if back {
                     self.autosave();
                     self.screen = Screen::Launcher;
                     self.refresh();

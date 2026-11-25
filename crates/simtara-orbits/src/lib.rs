@@ -6,7 +6,7 @@
 //! repeats exactly.
 //!
 //! Plugs in like any module and offers these commands to scripts and tools:
-//! `remove_body {name}`, `set_mass {name, mass}`, `body {name}`, `bodies`.
+//! `remove_body {name}`, `hide_body {name}`, `show_body {name}`, `set_mass {name, mass}`, `body {name}`, `bodies`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,6 +30,9 @@ pub struct Body {
     /// metres, for drawing only
     pub radius: f64,
     pub color: [u8; 3],
+    /// A hidden body still moves but pulls on nothing (as if it were not there). `show_body` brings it back.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,9 +78,9 @@ impl OrbitConfig {
         let sun_v = [0.0, -(me * earth_v[1] + mm * moon_v[1]) / ms];
         OrbitConfig {
             bodies: vec![
-                Body { name: "Sun".into(), mass: ms, pos: [0.0, 0.0], vel: sun_v, radius: 6.957e8, color: [255, 205, 70] },
-                Body { name: "Earth".into(), mass: me, pos: earth_pos, vel: earth_v, radius: 6.371e6, color: [90, 160, 255] },
-                Body { name: "Moon".into(), mass: mm, pos: moon_pos, vel: moon_v, radius: 1.737e6, color: [200, 200, 205] },
+                Body { name: "Sun".into(), mass: ms, pos: [0.0, 0.0], vel: sun_v, radius: 6.957e8, color: [255, 205, 70], hidden: false },
+                Body { name: "Earth".into(), mass: me, pos: earth_pos, vel: earth_v, radius: 6.371e6, color: [90, 160, 255], hidden: false },
+                Body { name: "Moon".into(), mass: mm, pos: moon_pos, vel: moon_v, radius: 1.737e6, color: [200, 200, 205], hidden: false },
             ],
             params: OrbitParams::default(),
         }
@@ -97,9 +100,9 @@ impl Bodies {
     /// Total energy (kinetic + gravitational), joules.
     pub fn energy(&self, p: &OrbitParams) -> f64 {
         let mut e = 0.0;
-        for (i, a) in self.list.iter().enumerate() {
+        for (i, a) in self.list.iter().enumerate().filter(|(_, a)| !a.hidden) {
             e += 0.5 * a.mass * (a.vel[0] * a.vel[0] + a.vel[1] * a.vel[1]);
-            for b in &self.list[i + 1..] {
+            for b in self.list[i + 1..].iter().filter(|b| !b.hidden) {
                 let d = dist(a.pos, b.pos).max(1.0);
                 e -= p.g * a.mass * b.mass / d;
             }
@@ -124,7 +127,8 @@ fn accelerations(list: &[Body], p: &OrbitParams, out: &mut Vec<[f64; 2]>) {
                 continue;
             }
             let inv = p.g / (r2 * r2.sqrt());
-            let (fi, fj) = (list[j].mass * inv, list[i].mass * inv);
+            let src = |b: &Body| if b.hidden { 0.0 } else { b.mass };
+            let (fi, fj) = (src(&list[j]) * inv, src(&list[i]) * inv);
             out[i][0] += d[0] * fi;
             out[i][1] += d[1] * fi;
             out[j][0] -= d[0] * fj;
@@ -180,6 +184,20 @@ fn register_commands(w: &mut World) {
         b.list.retain(|x| x.name != name);
         Ok(json!(b.list.len() < before))
     });
+    for (cmd, hide) in [("hide_body", true), ("show_body", false)] {
+        w.register_command(cmd, move |w, a| {
+            let name = name_arg(a)?.to_string();
+            let b = w.get_mut::<Bodies>().ok_or("no orbits in this universe")?;
+            match b.list.iter_mut().find(|x| x.name == name) {
+                Some(x) => {
+                    let changed = x.hidden != hide;
+                    x.hidden = hide;
+                    Ok(json!(changed))
+                }
+                None => Ok(json!(false)),
+            }
+        });
+    }
     w.register_command("set_mass", |w, a| {
         let name = name_arg(a)?.to_string();
         let mass = a
@@ -222,7 +240,7 @@ impl Module for OrbitModule {
         b.world.insert_persistent("orbit_params", cfg.params.clone());
         b.add_system(Stage::Update, OrbitSystem);
         register_commands(b.world);
-        b.add_metric("orbits.bodies", |w| w.get::<Bodies>().map_or(0.0, |b| b.list.len() as f64));
+        b.add_metric("orbits.bodies", |w| w.get::<Bodies>().map_or(0.0, |b| b.list.iter().filter(|x| !x.hidden).count() as f64));
         b.add_metric("orbits.energy", |w| match (w.get::<Bodies>(), w.get::<OrbitParams>()) {
             (Some(b), Some(p)) => b.energy(p),
             _ => 0.0,
