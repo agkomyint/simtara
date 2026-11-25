@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/simtara-core", "crates/simtara-particles", "crates/simtara-cli"]
+members = ["crates/simtara-core", "crates/simtara-particles", "crates/simtara-gpu", "crates/simtara-cli"]
 
 [workspace.package]
 version = "0.1.0"

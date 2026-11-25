@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- New `simtara-gpu` crate: wgpu + WGSL particle force kernel, registered as `Backend::Gpu`; automatic CPU fallback.
+- Core: `Builder.compute` (modules can register backends), `Compute::active()`.
+- Particles: shared `build_grid` / `accelerations_cpu` / `apply_acceleration` so CPU and GPU share one contract.
+- CLI: `--backend gpu|cpu`, `G` key to switch live, ms/tick reporting.
 ## v0.1.0
 
 First release.

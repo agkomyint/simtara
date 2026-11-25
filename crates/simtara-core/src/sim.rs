@@ -51,6 +51,8 @@ struct Schedule {
 pub struct Builder<'a> {
     pub world: &'a mut World,
     pub config: &'a Config,
+    /// Modules that provide a compute backend (e.g. GPU) register it here.
+    pub compute: &'a mut Compute,
     schedule: &'a mut Schedule,
 }
 
@@ -120,7 +122,7 @@ impl Simulation {
         self
     }
     fn build_module(&mut self, m: &dyn Module) {
-        let mut b = Builder { world: &mut self.world, config: &self.config, schedule: &mut self.schedule };
+        let mut b = Builder { world: &mut self.world, config: &self.config, compute: &mut self.compute, schedule: &mut self.schedule };
         m.build(&mut b);
     }
 
@@ -204,8 +206,9 @@ impl Simulation {
     pub fn compute_mut(&mut self) -> &mut Compute {
         &mut self.compute
     }
+    /// The backend that will actually run (requested one if available, else CPU).
     pub fn backend(&self) -> Backend {
-        self.compute.requested()
+        self.compute.active()
     }
     pub fn system_names(&self) -> Vec<&str> {
         self.schedule.systems.iter().map(|(_, s)| s.name()).collect()

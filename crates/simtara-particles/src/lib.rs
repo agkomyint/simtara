@@ -15,7 +15,7 @@ use simtara_core::{Backend, Builder, Context, Module, Rng, Simulation, Stage, Sy
 pub const MODULE: &str = "particles";
 
 /// Acceleration scale: force (dimensionless, -1..1) -> world units / s^2, per unit of `rmax`.
-const FORCE_SCALE: f32 = 10.0;
+pub const FORCE_SCALE: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Boundary {
@@ -159,42 +159,48 @@ impl System for ForceSystem {
         "particles.forces"
     }
     fn run(&mut self, ctx: &mut Context) {
+        // Competing implementations of this rule gate on the active backend;
+        // a GPU module supplies the Gpu one.
+        if ctx.compute.active() != Backend::Cpu {
+            return;
+        }
         let Some(mut p) = ctx.world.take::<Particles>() else { return };
         if let Some(prm) = ctx.world.get::<ParticleParams>() {
-            // A GPU implementation would be selected here; today only CPU is supported.
-            match ctx.compute.resolve(&[Backend::Cpu]) {
-                _ => forces_cpu(&mut p, prm, ctx.dt as f32),
-            }
+            forces_cpu(&mut p, prm, ctx.dt as f32);
         }
         ctx.world.put(p);
     }
 }
 
-fn forces_cpu(p: &mut Particles, prm: &ParticleParams, dt: f32) {
-    let n = p.len();
-    let kinds = prm.kinds;
-    if n == 0 || prm.attraction.len() != kinds * kinds {
-        return;
-    }
-    let rmax = prm.rmax.max(1e-3);
-    let (w, h) = (prm.width, prm.height);
-    let wrap = prm.boundary == Boundary::Wrap;
-    let beta = prm.repel_core.clamp(0.01, 0.95);
+/// Uniform spatial grid (cell >= rmax) so each particle only inspects a 3x3 neighbourhood.
+/// Built on the CPU (cheap, O(n)); shared by the CPU kernel and the GPU kernel.
+#[derive(Clone, Debug, Default)]
+pub struct Grid {
+    pub gw: u32,
+    pub gh: u32,
+    /// Cell index of each particle.
+    pub cells: Vec<u32>,
+    /// Prefix sums: particles of cell c are `order[start[c]..start[c+1]]`.
+    pub start: Vec<u32>,
+    pub order: Vec<u32>,
+}
 
-    // uniform grid, cell >= rmax so only the 3x3 neighbourhood matters
-    let gw = ((w / rmax).floor() as usize).max(1);
-    let gh = ((h / rmax).floor() as usize).max(1);
-    let (cw, ch) = (w / gw as f32, h / gh as f32);
-    let cells: Vec<usize> = (0..n)
+pub fn build_grid(p: &Particles, prm: &ParticleParams) -> Grid {
+    let n = p.len();
+    let rmax = prm.rmax.max(1e-3);
+    let gw = ((prm.width / rmax).floor() as usize).max(1);
+    let gh = ((prm.height / rmax).floor() as usize).max(1);
+    let (cw, ch) = (prm.width / gw as f32, prm.height / gh as f32);
+    let cells: Vec<u32> = (0..n)
         .map(|i| {
             let cx = ((p.x[i] / cw) as isize).clamp(0, gw as isize - 1) as usize;
             let cy = ((p.y[i] / ch) as isize).clamp(0, gh as isize - 1) as usize;
-            cy * gw + cx
+            (cy * gw + cx) as u32
         })
         .collect();
     let mut start = vec![0u32; gw * gh + 1];
     for &c in &cells {
-        start[c + 1] += 1;
+        start[c as usize + 1] += 1;
     }
     for i in 0..gw * gh {
         start[i + 1] += start[i];
@@ -202,9 +208,39 @@ fn forces_cpu(p: &mut Particles, prm: &ParticleParams, dt: f32) {
     let mut fill = start[..gw * gh].to_vec();
     let mut order = vec![0u32; n];
     for (i, &c) in cells.iter().enumerate() {
-        order[fill[c] as usize] = i as u32;
-        fill[c] += 1;
+        order[fill[c as usize] as usize] = i as u32;
+        fill[c as usize] += 1;
     }
+    Grid { gw: gw as u32, gh: gh as u32, cells, start, order }
+}
+
+/// Fold per-particle accelerations (from any backend) into velocities.
+pub fn apply_acceleration(p: &mut Particles, acc: &[[f32; 2]], dt: f32) {
+    for (i, a) in acc.iter().enumerate().take(p.len()) {
+        p.vx[i] += a[0] * dt;
+        p.vy[i] += a[1] * dt;
+    }
+}
+
+/// True if the parameters describe a valid, runnable force field.
+pub fn params_valid(p: &Particles, prm: &ParticleParams) -> bool {
+    !p.is_empty() && prm.kinds >= 1 && prm.attraction.len() == prm.kinds * prm.kinds
+}
+
+/// Reference CPU kernel: per-particle acceleration. The GPU kernel must match this.
+pub fn accelerations_cpu(p: &Particles, prm: &ParticleParams) -> Vec<[f32; 2]> {
+    if !params_valid(p, prm) {
+        return Vec::new();
+    }
+    let n = p.len();
+    let kinds = prm.kinds;
+    let rmax = prm.rmax.max(1e-3);
+    let (w, h) = (prm.width, prm.height);
+    let wrap = prm.boundary == Boundary::Wrap;
+    let beta = prm.repel_core.clamp(0.01, 0.95);
+    let g = build_grid(p, prm);
+    let (gw, gh) = (g.gw as usize, g.gh as usize);
+    let (cells, start, order) = (&g.cells, &g.start, &g.order);
 
     let (px, py, kind, charge, mass) = (&p.x, &p.y, &p.kind, &p.charge, &p.mass);
     let r2max = rmax * rmax;
@@ -213,7 +249,7 @@ fn forces_cpu(p: &mut Particles, prm: &ParticleParams, dt: f32) {
         .map(|i| {
             let (xi, yi) = (px[i], py[i]);
             let ki = (kind[i] as usize).min(kinds - 1);
-            let (cx, cy) = ((cells[i] % gw) as isize, (cells[i] / gw) as isize);
+            let (cx, cy) = ((cells[i] as usize % gw) as isize, (cells[i] as usize / gw) as isize);
             let mut seen = [usize::MAX; 9];
             let mut ns = 0;
             let (mut ax, mut ay) = (0.0f32, 0.0f32);
@@ -274,10 +310,12 @@ fn forces_cpu(p: &mut Particles, prm: &ParticleParams, dt: f32) {
         })
         .collect();
 
-    for i in 0..n {
-        p.vx[i] += acc[i][0] * dt;
-        p.vy[i] += acc[i][1] * dt;
-    }
+    acc
+}
+
+fn forces_cpu(p: &mut Particles, prm: &ParticleParams, dt: f32) {
+    let acc = accelerations_cpu(p, prm);
+    apply_acceleration(p, &acc, dt);
 }
 
 struct IntegrateSystem;

@@ -35,6 +35,15 @@ impl Compute {
     pub fn is_available(&self, b: Backend) -> bool {
         self.available.contains(&b)
     }
+    /// The backend that will actually run: the requested one if available, else CPU.
+    /// Competing implementations of one rule (CPU system, GPU system) each gate on this.
+    pub fn active(&self) -> Backend {
+        if self.available.contains(&self.requested) {
+            self.requested
+        } else {
+            Backend::Cpu
+        }
+    }
     /// Pick the backend a system should use, given the ones it implements.
     pub fn resolve(&self, supported: &[Backend]) -> Backend {
         if supported.contains(&self.requested) && self.available.contains(&self.requested) {

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 simtara-core = { path = "../simtara-core" }
 simtara-particles = { path = "../simtara-particles" }
+simtara-gpu = { path = "../simtara-gpu" }
 serde_json.workspace = true
 minifb = "0.28"
 png = "0.17"

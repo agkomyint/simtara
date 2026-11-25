@@ -3,11 +3,12 @@
 //!   simtara run  [opts]   headless: advance N ticks, print stats, optionally save/render
 //!   simtara view [opts]   live window: Play/Pause, Reset, Gravity, Count, Speed
 //!
-//! opts: --particles N  --kinds K  --seed S  --steps N  --spread X  --base X
+//! opts: --backend gpu|cpu  --particles N  --kinds K  --seed S  --steps N  --spread X  --base X
 //!       --load FILE  --save FILE  --png FILE
 
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
-use simtara_core::{Config, RunState, Simulation};
+use simtara_core::{Backend, Config, RunState, Simulation};
+use simtara_gpu::GpuModule;
 use simtara_particles::{simulation, stats, Boundary, ParticleConfig, ParticleParams, Particles};
 use std::collections::HashMap;
 
@@ -30,7 +31,25 @@ fn get<T: std::str::FromStr>(o: &HashMap<String, String>, k: &str, d: T) -> T {
     o.get(k).and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
+fn attach_gpu(sim: &mut Simulation, o: &HashMap<String, String>) {
+    let want = o.get("backend").map(String::as_str).unwrap_or("gpu");
+    let gpu = GpuModule::new();
+    if gpu.available() {
+        println!("GPU: {}", gpu.description());
+    } else {
+        println!("GPU {} - using CPU", gpu.description());
+    }
+    sim.add_module(gpu);
+    sim.compute_mut().set_requested(if want == "cpu" { Backend::Cpu } else { Backend::Gpu });
+}
+
 fn build(o: &HashMap<String, String>) -> Result<Simulation, String> {
+    let mut sim = build_cpu(o)?;
+    attach_gpu(&mut sim, o);
+    Ok(sim)
+}
+
+fn build_cpu(o: &HashMap<String, String>) -> Result<Simulation, String> {
     if let Some(f) = o.get("load") {
         let snap = Simulation::read_snapshot(f)?;
         let pc: ParticleConfig = snap.config.module(simtara_particles::MODULE);
@@ -105,11 +124,15 @@ fn run(o: &HashMap<String, String>) -> Result<(), String> {
     let mut sim = build(o)?;
     let steps: u64 = get(o, "steps", 600);
     let every = (steps / 6).max(1);
+    println!("backend: {:?}", sim.backend());
     report(&sim);
+    let t0 = std::time::Instant::now();
     for _ in 0..steps / every {
         sim.advance(every);
         report(&sim);
     }
+    let el = t0.elapsed().as_secs_f64();
+    println!("{:.2} ms/tick ({:.0} ticks/s)", el * 1000.0 / (steps / every * every) as f64, (steps / every * every) as f64 / el);
     if let Some(f) = o.get("save") {
         sim.save_to(f)?;
         println!("saved snapshot -> {f}");
@@ -143,7 +166,7 @@ fn view(o: &HashMap<String, String>) -> Result<(), String> {
     window.set_target_fps(60);
     let mut buf = vec![0u32; WIN * WIN];
     sim.play();
-    println!("Space play/pause | R reset | Up/Down gravity | PgUp/PgDn particle count | Left/Right speed | B bounce/wrap | S save | L load | Esc quit");
+    println!("Space play/pause | R reset | Up/Down gravity | PgUp/PgDn particle count | Left/Right speed | B bounce/wrap | G gpu/cpu | S save | L load | Esc quit");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let press = |k| window.is_key_pressed(k, KeyRepeat::No);
@@ -178,6 +201,11 @@ fn view(o: &HashMap<String, String>) -> Result<(), String> {
         if press(Key::PageDown) {
             reconfigure(&mut sim, (count * 2 / 3).clamp(1000, 100_000), true);
         }
+        if press(Key::G) {
+            let c = sim.compute_mut();
+            let next = if c.active() == Backend::Gpu { Backend::Cpu } else { Backend::Gpu };
+            c.set_requested(next);
+        }
         if press(Key::B) {
             if let Some(p) = sim.world_mut().get_mut::<ParticleParams>() {
                 p.boundary = if p.boundary == Boundary::Bounce { Boundary::Wrap } else { Boundary::Bounce };
@@ -200,13 +228,14 @@ fn view(o: &HashMap<String, String>) -> Result<(), String> {
         render(&sim, WIN, &mut buf);
         let (g, b) = sim.world().get::<ParticleParams>().map(|p| (p.gravity, p.boundary)).unwrap_or((0.0, Boundary::Bounce));
         window.set_title(&format!(
-            "SimTara — {} | tick {} | {} particles | gravity {:.2} | speed {:.2}x | {:?}",
+            "SimTara — {} | tick {} | {} particles | gravity {:.2} | speed {:.2}x | {:?} | {:?}",
             if sim.run_state() == RunState::Running { "▶" } else { "⏸" },
             sim.world().clock.tick,
             count,
             g,
             sim.speed(),
-            b
+            b,
+            sim.backend()
         ));
         window.update_with_buffer(&buf, WIN, WIN).map_err(|e| e.to_string())?;
     }
