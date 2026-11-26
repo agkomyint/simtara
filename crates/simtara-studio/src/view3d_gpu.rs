@@ -55,6 +55,8 @@ pub struct Uniforms {
     /// Objects in the liquid, drawn exactly: (ball?, centre, half sizes), world units. Up to 4.
     pub objects: [(bool, [f32; 3], [f32; 3]); 4],
     pub n_objects: u32,
+    /// Which object is being steered (drawn with a glow).
+    pub steered: Option<usize>,
 }
 
 impl Uniforms {
@@ -65,7 +67,7 @@ impl Uniforms {
         let cell = (0..3).map(|a| vs[a] / vd[a] as f32).fold(f32::MAX, f32::min);
         let ob = |i: usize| {
             let (ball, c, h) = self.objects[i];
-            [[c[0], c[1], c[2], if ball { 0.0 } else { 1.0 }], [h[0], h[1], h[2], 0.0]]
+            [[c[0], c[1], c[2], if ball { 0.0 } else { 1.0 }], [h[0], h[1], h[2], if Some(i) == self.steered { 1.0 } else { 0.0 }]]
         };
         let all: [[f32; 4]; 21] = [
             v4(self.eye, 0.0),
@@ -354,6 +356,7 @@ impl Gpu3d {
         u.pool = volume.is_some_and(|v| v.water_radius > 0.0);
         u.blend = volume.map_or(1.0, |v| v.blend.clamp(0.0, 1.0));
         u.n_objects = 0;
+        u.steered = volume.and_then(|v| v.steered);
         if let Some(v) = volume {
             for (i, (shape, c, h)) in v.objects.iter().take(4).enumerate() {
                 u.objects[i] = (shape == "ball", *c, *h);
@@ -950,17 +953,20 @@ fn hit_object(o: vec3<f32>, d: vec3<f32>, i: u32) -> vec4<f32> {
     let d = ray[1];
     // the nearest object, drawn with its exact shape (a warm yellow, easy to follow in the water)
     var best = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+    var which = 0u;
     let count = u32(U.water.w);
     for (var i = 0u; i < count; i = i + 1u) {
         let hit = hit_object(o, d, i);
-        if (hit.w < best.w) { best = hit; }
+        if (hit.w < best.w) { best = hit; which = i; }
     }
     if (best.w < 1e8) {
         let p = o + d * best.w;
         let k = min(U.mode.y + U.mode.z * max(dot(best.xyz, U.light.xyz), 0.0), 1.4);
         let spec = pow(max(dot(reflect(d, best.xyz), U.light.xyz), 0.0), 40.0) * 0.4 * U.mode.z;
         var out: SolidOut;
-        out.colour = vec4<f32>(min(vec3<f32>(0.95, 0.72, 0.22) * k + vec3<f32>(spec), vec3<f32>(1.0)), 1.0);
+        var palette = array<vec3<f32>, 4>(vec3<f32>(0.95, 0.72, 0.22), vec3<f32>(0.90, 0.30, 0.25), vec3<f32>(0.30, 0.55, 0.95), vec3<f32>(0.40, 0.80, 0.35));
+        let rim = pow(1.0 - abs(dot(best.xyz, d)), 2.0) * U.objs[2u * which + 1u].w;
+        out.colour = vec4<f32>(min(palette[which] * k + vec3<f32>(spec) + vec3<f32>(1.0, 1.0, 0.8) * rim * 0.9, vec3<f32>(1.0)), 1.0);
         let c = project(p);
         out.depth = clamp(c.z / c.w, 0.0, 1.0);
         return out;
@@ -1108,6 +1114,7 @@ mod tests {
             blend: 1.0,
             objects: [(true, [0.0; 3], [0.0; 3]); 4],
             n_objects: 0,
+            steered: None,
         }
     }
 
@@ -1177,7 +1184,7 @@ mod tests {
         for c in 0..(n * n * n) as usize {
             data[c * 4] = 26;
         }
-        let vol = Volume { dims: [n; 3], size: [2.0; 3], data, water_radius: 0.0, caustics: None, liquid: None, generation: 0, blend: 1.0, objects: Vec::new() };
+        let vol = Volume { dims: [n; 3], size: [2.0; 3], data, water_radius: 0.0, caustics: None, liquid: None, generation: 0, blend: 1.0, objects: Vec::new(), steered: None };
         let mut u = camera(false);
         u.eye = [1.0, 10.0, 1.0];
         let size = [64, 64];
@@ -1226,7 +1233,7 @@ mod tests {
                 }
             }
         }
-        let vol = Volume { dims: [n; 3], size: [1.0; 3], data: vec![0; (n * n * n * 4) as usize], water_radius: 0.03, caustics: None, liquid: Some(field), generation: 0, blend: 1.0, objects: Vec::new() };
+        let vol = Volume { dims: [n; 3], size: [1.0; 3], data: vec![0; (n * n * n * 4) as usize], water_radius: 0.03, caustics: None, liquid: Some(field), generation: 0, blend: 1.0, objects: Vec::new(), steered: None };
         let mut u = camera(false);
         u.eye = [0.5, 4.0, 0.5];
         u.ambient = 0.5;

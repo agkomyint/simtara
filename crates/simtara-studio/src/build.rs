@@ -21,7 +21,7 @@ pub const EXAMPLES: [(&str, &str, &str); 15] = [
     ("Bouncing things (3D)", "120 balls, cubes, pyramids and ships bouncing. Turn the camera and light, change gravity and wind, shake as a human.", include_str!("../../../examples/balls3d.luau")),
     ("Smoke and wind around a building (3D)", "A real fluid in metres and seconds: wind flows around a building, a hot chimney's smoke rises and swirls in the wake.", include_str!("../../../examples/smoke.luau")),
     ("Fire plume (3D smoke and heat)", "A fire heats the air; the hot column rises, curls into a mushroom and breaks into swirls around a beam.", include_str!("../../../examples/plume.luau")),
-    ("Play in a pool: steer a ball (3D)", "Arrow keys / WASD move a ball through real water, E and Q up and down. A floating ball and a boat ride your waves.", include_str!("../../../examples/play.luau")),
+    ("Play in a pool: steer three balls (3D)", "Keys 1-3 choose a ball, arrow keys / WASD move it through real water, E and Q up and down. A boat rides your waves.", include_str!("../../../examples/play.luau")),
     ("Water: a dam breaks (3D)", "75,000 water particles (FLIP): a wall of water crashes into a block, splashes up the far wall and settles.", include_str!("../../../examples/water.luau")),
     ("Pour a real liquid into a glass (3D)", "Real viscosity and density: honey, water, olive oil, milk, mercury... poured into a glass at real size. Change LIQUID at the top.", include_str!("../../../examples/pour.luau")),
     ("Airflow around a building (3D)", "A wind tunnel of 6,000 air cells. Smoke streaks show the air going around a building. Turn wind, viscosity and gusts.", include_str!("../../../examples/airflow.luau")),
@@ -259,6 +259,8 @@ pub struct BuildView {
     step_gap: f32,
     /// the steering keys last seen (and the camera's turn), so controls change only when they do
     keys_held: [i32; 4],
+    /// which steerable object the keys drive (index among those with `keys = true`)
+    pub steer: usize,
     /// the 3D view's widget id (it takes the keyboard when clicked)
     view_id: Option<egui::Id>,
     /// frames per second of the window (smoothed), and when the last frame started
@@ -329,6 +331,7 @@ impl BuildView {
             step_seen: (0, std::time::Instant::now()),
             step_gap: 0.1,
             keys_held: [0; 4],
+            steer: 0,
             view_id: None,
             fps: 0.0,
             frame_at: std::time::Instant::now(),
@@ -432,6 +435,34 @@ impl BuildView {
         }
         let Some(f) = self.sim.world().get::<simtara_fields::Fluid>() else { return };
         let mut edits: Vec<(String, f64)> = Vec::new();
+        // which steerable object the keys drive: N goes to the next, 1-4 pick one
+        let steerable: Vec<usize> = f.objects.iter().enumerate().filter(|(_, o)| o.keys).map(|(i, _)| i).collect();
+        if steerable.is_empty() {
+            return;
+        }
+        let (tab, pick) = ui.input(|i| {
+            use egui::Key;
+            let pick = [Key::Num1, Key::Num2, Key::Num3, Key::Num4].iter().position(|k| i.key_pressed(*k));
+            (i.key_pressed(Key::N), pick)
+        });
+        let before = self.steer;
+        if let Some(n) = pick.filter(|n| *n < steerable.len()) {
+            self.steer = n;
+        } else if tab {
+            self.steer = (self.steer + 1) % steerable.len();
+        }
+        self.steer = self.steer.min(steerable.len() - 1);
+        if self.steer != before {
+            // let go of the one steered before
+            for a in 0..3 {
+                if let simtara_fields::Num::P(name) = &f.objects[steerable[before.min(steerable.len() - 1)]].drive[a] {
+                    edits.push((name.clone(), 0.0));
+                }
+            }
+            self.keys_held = [9; 4];
+            self.status = format!("steering '{}' (N or 1-{} to switch)", f.objects[steerable[self.steer]].name, steerable.len());
+        }
+        let current = steerable[self.steer];
         let (l, r, fwd, back, up, down) = ui.input(|i| {
             use egui::Key;
             let k = |a: Key, b: Key| i.key_down(a) || i.key_down(b);
@@ -447,7 +478,7 @@ impl BuildView {
         // only when the keys change (pressed or let go): otherwise the sliders are left alone,
         // so a ball can be driven from the Controls too
         let held = [ax as i32, ay as i32, az as i32, (yaw * 10.0) as i32];
-        if held == self.keys_held {
+        if held == self.keys_held && edits.is_empty() {
             return;
         }
         self.keys_held = held;
@@ -460,7 +491,7 @@ impl BuildView {
         if self.sim.run_state() != RunState::Running && (ax != 0.0 || ay != 0.0 || az != 0.0) {
             self.status = "press ▶ Start: objects move while the universe runs".into();
         }
-        for ob in f.objects.iter().filter(|o| o.keys) {
+        for ob in f.objects.iter().enumerate().filter(|(i, _)| *i == current).map(|(_, o)| o) {
             let v = [(ax * rx + ay * fx) * ob.speed, (ax * ry + ay * fy) * ob.speed, az * ob.speed];
             for a in 0..3 {
                 if let simtara_fields::Num::P(name) = &ob.drive[a] {
@@ -969,6 +1000,7 @@ impl BuildView {
                     liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()),
                     generation: r.generation,
                     objects: r.objects.clone(),
+                    steered: f.objects.iter().enumerate().filter(|(_, o)| o.keys).map(|(i, _)| i).nth(self.steer),
                     blend: {
                         // a new step: remember when it came and how long steps take
                         if self.step_seen.0 != r.generation {
@@ -1019,7 +1051,7 @@ impl BuildView {
                     .collect();
                 painter.text(resp.rect.left_bottom() + egui::vec2(80.0, -8.0), egui::Align2::LEFT_BOTTOM, format!("#{} {}   {}", th.id, th.kind, props.join("  ")), egui::FontId::monospace(12.0), egui::Color32::WHITE);
             }
-            painter.text(resp.rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · 3D · {} {:.1} ms · {:.0} fps · drag to turn, scroll to zoom{}", if self.gpu3d.is_some() { "GPU" } else { "CPU" }, self.draw_ms, self.fps, if steerable { " · arrow keys / WASD steer, E/Q up/down" } else { "" }), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
+            painter.text(resp.rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · 3D · {} {:.1} ms · {:.0} fps · drag to turn, scroll to zoom{}", if self.gpu3d.is_some() { "GPU" } else { "CPU" }, self.draw_ms, self.fps, if steerable { " · arrow keys / WASD steer, E/Q up/down, 1-4 or N: which object" } else { "" }), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
             self.pick = new_pick;
             self.show_links = Some(links_on);
             let cam_changed = (cam.yaw, cam.pitch, cam.distance, cam.fov, cam.follow) != (cam0.yaw, cam0.pitch, cam0.distance, cam0.fov, cam0.follow);

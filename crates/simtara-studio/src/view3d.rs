@@ -128,6 +128,8 @@ pub struct Volume {
     pub blend: f32,
     /// Objects moving in the liquid: shape, centre and half sizes (metres).
     pub objects: Vec<(String, [f32; 3], [f32; 3])>,
+    /// The object the keys steer (drawn with a glow).
+    pub steered: Option<usize>,
 }
 
 impl Volume {
@@ -586,6 +588,7 @@ pub fn scene(rect: egui::Rect, items: &[Item], cam: &Camera, light: &Light, volu
             blend: volume.map_or(1.0, |v| v.blend),
             objects: [(true, [0.0; 3], [0.0; 3]); 4],
             n_objects: 0,
+            steered: None,
         };
     Some(Scene { view, uniforms: u_, unit, focal, ortho, lo, hi, l, z0, ground: [x0, y0, x1, y1] })
 }

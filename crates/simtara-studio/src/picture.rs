@@ -47,7 +47,7 @@ fn contents(sim: &simtara_core::Simulation) -> (Vec<Item>, Option<Volume>) {
         }
         let d = f.dims();
         let water = f.kind == simtara_fields::Kind::Water;
-        volume = Some(Volume { dims: [d.nx as u32, d.ny as u32, d.nz as u32], size: f.extent(), data: r.rgba.clone(), water_radius: if water { f.cell * 0.55 } else { 0.0 }, caustics: r.caustics.clone(), liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()), generation: r.generation, blend: 1.0, objects: r.objects.clone() });
+        volume = Some(Volume { dims: [d.nx as u32, d.ny as u32, d.nz as u32], size: f.extent(), data: r.rgba.clone(), water_radius: if water { f.cell * 0.55 } else { 0.0 }, caustics: r.caustics.clone(), liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()), generation: r.generation, blend: 1.0, objects: r.objects.clone(), steered: None });
     }    (items, volume)
 }
 
