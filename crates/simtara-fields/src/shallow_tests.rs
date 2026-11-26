@@ -197,3 +197,68 @@ fn wind_piles_water_up_by_its_stress() {
     assert!((got - want).abs() < 0.03 * want, "{got} vs {want}");
     assert!(f.summary().iter().any(|m| m.0 == "wind.stress_pa" && (m.1 - tau).abs() < 1e-9));
 }
+/// An impact in open water: the crater holds exactly the share of the rock's energy that
+/// Ward & Asphaug give it, no water is made or lost, and the rings run at the speed of
+/// shallow-water waves (a little faster for waves this tall: c = sqrt(g (h + a))).
+#[test]
+fn an_impact_blasts_a_crater_of_the_right_energy_and_rings_run_at_the_wave_speed() {
+    let (n, dx, depth) = (300usize, 5.0f64, 10.0f64);
+    let mut f = basin(n, n, dx, 5.0);
+    f.edges = [Edge::Open; 4];
+    for c in 0..f.h.len() {
+        f.h[c] = depth;
+    }
+    let mid = n as f64 * dx / 2.0;
+    let v0 = f.volume();
+    f.blast([mid, mid], 10.0, 200.0, 3000.0);
+    let (r, d, energy) = (f.last_impact[0], f.last_impact[1], f.last_impact[2]);
+    let pe: f64 = f.h.iter().map(|h| 0.5 * f.density * f.gravity * (h - depth).powi(2)).sum::<f64>() * dx * dx;
+    eprintln!("crater radius {r:.1} m, depth {d:.2} m; its energy {pe:.3e} J = {:.3} of the rock's {energy:.3e} J", pe / energy);
+    assert!((pe / energy - IMPACT_EFFICIENCY).abs() < 0.05 * IMPACT_EFFICIENCY, "crater energy {pe} vs {}", IMPACT_EFFICIENCY * energy);
+    assert!((f.volume() - v0).abs() < 1e-6 * v0, "the crater makes no water");
+    let crest = |f: &Flood| -> (f64, f64) {
+        let j = n / 2;
+        (n / 2..n).map(|i| ((i as f64 + 0.5) * dx - mid, f.h[j * n + i] - depth)).fold((0.0, f64::MIN), |b, x| if x.1 > b.1 { x } else { b })
+    };
+    let p = BTreeMap::new();
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        f.step(&p);
+        seen.push((f.seconds, crest(&f)));
+    }
+    let ((t1, (r1, _)), (t2, (r2, a2))) = (seen[3], seen[11]);
+    let speed = (r2 - r1) / (t2 - t1);
+    let (c, c_tall) = ((f.gravity * depth).sqrt(), (f.gravity * (depth + a2)).sqrt());
+    eprintln!("rings at {speed:.2} m/s: sqrt(g h) = {c:.2}, sqrt(g (h + a)) = {c_tall:.2} m/s");
+    assert!(speed > c * 0.98 && speed < c_tall * 1.04, "ring speed {speed}");
+    assert!((f.volume() - v0).abs() < 1e-3 * v0, "water kept");
+}
+
+/// A small ring of waves spreading over open water shares its energy round a growing circle:
+/// far out its height falls as 1 / sqrt(distance) (linear long waves in two dimensions).
+#[test]
+fn a_spreading_ring_falls_as_one_over_root_distance() {
+    let (n, dx, depth) = (400usize, 5.0f64, 10.0f64);
+    let mut f = basin(n, n, dx, 5.0);
+    f.edges = [Edge::Open; 4];
+    let mid = n as f64 * dx / 2.0;
+    for c in 0..f.h.len() {
+        let p = f.centre(c);
+        let rr = (p[0] - mid).powi(2) + (p[1] - mid).powi(2);
+        f.h[c] = depth + 0.05 * (-rr / (2.0 * 60.0f64.powi(2))).exp();
+    }
+    let crest = |f: &Flood| -> (f64, f64) {
+        let j = n / 2;
+        (n / 2..n).map(|i| ((i as f64 + 0.5) * dx - mid, f.h[j * n + i] - depth)).fold((0.0, f64::MIN), |b, x| if x.1 > b.1 { x } else { b })
+    };
+    let p = BTreeMap::new();
+    let mut seen = Vec::new();
+    for _ in 0..18 {
+        f.step(&p);
+        seen.push(crest(&f));
+    }
+    let ((r1, a1), (r2, a2)) = (seen[5], seen[17]);
+    let want = a1 * (r1 / r2).sqrt();
+    eprintln!("height {a1:.4} m at {r1:.0} m, {a2:.4} m at {r2:.0} m; 1/sqrt(r) gives {want:.4} m");
+    assert!((a2 - want).abs() < 0.08 * want, "{a2} vs {want}");
+}

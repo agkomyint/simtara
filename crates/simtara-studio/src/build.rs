@@ -13,7 +13,7 @@ use simtara_things::Things;
 use crate::view3d;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXAMPLES: [(&str, &str, &str); 17] = [
+pub const EXAMPLES: [(&str, &str, &str); 18] = [
     ("Empty universe", "A blank page with a few hints. Describe what exists, then the rules.", EMPTY),
     ("An idea spreads", "1,500 people, 3 of them know an idea. Each tells friends. No physics at all.", IDEA),
     ("Forest fire (physics + chemistry)", "Fuel, heat and oxygen. Turn oxygen, rain and ignition temperature while it burns.", include_str!("../../../examples/fire.luau")),
@@ -23,6 +23,7 @@ pub const EXAMPLES: [(&str, &str, &str); 17] = [
     ("Fire plume (3D smoke and heat)", "A fire heats the air; the hot column rises, curls into a mushroom and breaks into swirls around a beam.", include_str!("../../../examples/plume.luau")),
     ("Play in a pool: steer three balls (3D)", "Keys 1-3 choose a ball, arrow keys / WASD move it through real water, E and Q up and down. A boat rides your waves.", include_str!("../../../examples/play.luau")),
     ("Tsunami hits a coastal town (3D)", "An earthquake offshore lifts the sea floor; the tsunami crosses the bay, runs up the beach and through the streets. Shallow-water equations in metres and seconds.", include_str!("../../../examples/tsunami.luau")),
+    ("Drop a rock into the sea (3D)", "Set drop to 1: a rock's energy blasts a crater in the sea, which collapses into rings of waves that run up the beach. Choose its size, speed and density.", include_str!("../../../examples/meteor.luau")),
     ("River valley flood and dam break (3D)", "Rain, a swollen river and a dam you can lower: watch the flood spread down the valley and into the town.", include_str!("../../../examples/flood.luau")),
     ("Water: a dam breaks (3D)", "75,000 water particles (FLIP): a wall of water crashes into a block, splashes up the far wall and settles.", include_str!("../../../examples/water.luau")),
     ("Pour a real liquid into a glass (3D)", "Real viscosity and density: honey, water, olive oil, milk, mercury... poured into a glass at real size. Change LIQUID at the top.", include_str!("../../../examples/pour.luau")),

@@ -73,6 +73,42 @@ pub struct Quake {
     pub done: bool,
 }
 
+/// Something big falling into the water: a rock, an asteroid. Its energy blasts a crater in the
+/// water (Ward & Asphaug 2000: a fraction of the kinetic energy becomes the crater's potential
+/// energy), which collapses into rings of waves.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Impact {
+    pub at: [f64; 2],
+    /// metres, m/s, kg/m³
+    pub diameter: Num,
+    pub speed: Num,
+    pub density: Num,
+    pub when: f64,
+    pub trigger: Option<String>,
+    pub done: bool,
+}
+
+/// Share of an impactor's kinetic energy that goes into the crater in the water (Ward & Asphaug 2000).
+pub const IMPACT_EFFICIENCY: f64 = 0.15;
+
+/// The crater an impact blasts in water of depth `depth`: (radius, depth) in metres. The crater
+/// is the mass-keeping dish eta = -D (1 - 2 r²/R²) (a hole with a raised rim, no water made),
+/// whose potential energy pi rho g D² R² / 6 equals the share of the energy; depth half the
+/// radius, unless it reaches the sea floor.
+pub fn crater(diameter: f64, speed: f64, density: f64, water: f64, g: f64, depth: f64) -> (f64, f64, f64) {
+    let mass = density * std::f64::consts::PI / 6.0 * diameter.powi(3);
+    let energy = 0.5 * mass * speed * speed;
+    let e = IMPACT_EFFICIENCY * energy;
+    let q = 0.5;
+    let mut r = (6.0 * e / (std::f64::consts::PI * water * g * q * q)).powf(0.25);
+    let mut d = q * r;
+    if d > depth && depth > 0.0 {
+        d = depth;
+        r = (6.0 * e / (std::f64::consts::PI * water * g * d * d)).sqrt();
+    }
+    (r, d, energy)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FloodMetric {
     pub name: String,
@@ -165,6 +201,11 @@ pub struct Flood {
     /// flags that show the wind: x, y (metres) and pole height (metres)
     #[serde(default)]
     pub flags: Vec<[f64; 3]>,
+    #[serde(default)]
+    pub impacts: Vec<Impact>,
+    /// the last impact: crater radius, crater depth (m), energy (J)
+    #[serde(default)]
+    pub last_impact: [f64; 3],
     pub seconds: f64,
     pub substeps: usize,
     /// water added by rain and rivers, m³
@@ -500,6 +541,7 @@ impl Flood {
         }
         self.apply_gates(params);
         self.apply_quakes(params);
+        self.apply_impacts(params);
         let manning = self.manning.get(params).max(0.0) as f64;
         // wind: the stress it puts on the water, rho_air C_d |U| U (pascals)
         let (ws, wd) = (self.wind_speed.get(params).max(0.0) as f64, (self.wind_dir.get(params) as f64).to_radians());
@@ -649,6 +691,66 @@ impl Flood {
         }
     }
 
+    fn apply_impacts(&mut self, params: &BTreeMap<String, Param>) {
+        for k in 0..self.impacts.len() {
+            let im = self.impacts[k].clone();
+            if im.done {
+                // a control that went back below 1 arms it again: drop another
+                if let Some(name) = &im.trigger {
+                    if params.get(name).is_some_and(|p| p.value < 1.0) {
+                        self.impacts[k].done = false;
+                    }
+                }
+                continue;
+            }
+            let due = match &im.trigger {
+                Some(name) => params.get(name).is_some_and(|p| p.value >= 1.0),
+                None => self.seconds + 1e-9 >= im.when,
+            };
+            if due {
+                self.impacts[k].done = true;
+                self.blast(im.at, im.diameter.get(params) as f64, im.speed.get(params) as f64, im.density.get(params) as f64);
+            }
+        }
+    }
+
+    /// Blast the crater of an impact into the water at `at` (see `crater`).
+    pub fn blast(&mut self, at: [f64; 2], diameter: f64, speed: f64, density: f64) {
+        let (i, j) = (((at[0] / self.cell) as usize).min(self.nx - 1), ((at[1] / self.cell) as usize).min(self.ny - 1));
+        let depth = self.h[j * self.nx + i];
+        if depth <= 0.0 || diameter <= 0.0 || speed <= 0.0 {
+            return;
+        }
+        let (r, d, energy) = crater(diameter, speed, density.max(1.0), self.density, self.gravity, depth);
+        self.last_impact = [r, d, energy];
+        // the dish, only where there is water, and no water made or lost: what clipping at the
+        // sea floor or dry land takes is spread back over the dish
+        let cells: Vec<(usize, f64)> = (0..self.h.len())
+            .filter_map(|c| {
+                let p = self.centre(c);
+                let rr = ((p[0] - at[0]).powi(2) + (p[1] - at[1]).powi(2)).sqrt() / r;
+                (rr < 1.0 && self.h[c] > 0.0).then(|| (c, -d * (1.0 - 2.0 * rr * rr)))
+            })
+            .collect();
+        if cells.is_empty() {
+            return;
+        }
+        let before: f64 = cells.iter().map(|(c, _)| self.h[*c]).sum();
+        for &(c, eta) in &cells {
+            self.h[c] = (self.h[c] + eta).max(0.0);
+            self.hu[c] = 0.0;
+            self.hv[c] = 0.0;
+        }
+        let after: f64 = cells.iter().map(|(c, _)| self.h[*c]).sum();
+        let wet: Vec<usize> = cells.iter().map(|(c, _)| *c).filter(|c| self.h[*c] > 0.0).collect();
+        if !wet.is_empty() {
+            let fix = (before - after) / wet.len() as f64;
+            for c in wet {
+                self.h[c] = (self.h[c] + fix).max(0.0);
+            }
+        }
+    }
+
     /// A solitary wave (the classic model of a tsunami's leading wave) of height `height`,
     /// centred `at` metres along `dir`, travelling along it, on still water of depth `depth`.
     pub fn add_solitary(&mut self, height: f64, at: f64, dir: [f64; 2], depth: f64) {
@@ -743,6 +845,9 @@ impl Flood {
             ("flood.deepest_on_land_m".into(), deepest),
             ("flood.fastest_m_s".into(), fastest),
             ("flood.substeps".into(), self.substeps as f64),
+            ("impact.crater_radius_m".into(), self.last_impact[0]),
+            ("impact.crater_depth_m".into(), self.last_impact[1]),
+            ("impact.energy_j".into(), self.last_impact[2]),
             ("wind.speed_m_s".into(), (self.wind_now[0].powi(2) + self.wind_now[1].powi(2)).sqrt()),
             ("wind.stress_pa".into(), self.wind_stress),
         ];
@@ -1142,6 +1247,16 @@ fn register_commands(w: &mut World) {
         let uplift = number(a, "uplift")?.ok_or("quake needs uplift = metres (or a control)")?;
         f.quakes.push(Quake { at: [at[0], at[1]], size: [size[0], size[1]], uplift, when: a.get("when").and_then(Value::as_f64).unwrap_or(0.0), trigger: a.get("trigger").and_then(Value::as_str).map(str::to_string), done: false });
         Ok(json!(f.quakes.len()))
+    });
+    // impact{at = {x, y}, diameter = m, speed = m/s, density = kg/m³, when = seconds | trigger = "control"}
+    w.register_command("impact", |w, a| {
+        let f = flood_mut(w)?;
+        let at = nums(a, "at", 2)?.ok_or("impact needs at = {x, y} (metres)")?;
+        let diameter = number(a, "diameter")?.ok_or("impact needs diameter = metres (or a control)")?;
+        let speed = number(a, "speed")?.ok_or("impact needs speed = m/s (or a control)")?;
+        let density = number(a, "density")?.unwrap_or(Num::N(3000.0));
+        f.impacts.push(Impact { at: [at[0], at[1]], diameter, speed, density, when: a.get("when").and_then(Value::as_f64).unwrap_or(0.0), trigger: a.get("trigger").and_then(Value::as_str).map(str::to_string), done: false });
+        Ok(json!(f.impacts.len()))
     });
     // flood_metric{name, field = depth | level | speed | wet | max_depth | arrival | ground, op = sum | mean | max | min | count, box = {...}?}
     w.register_command("flood_metric", |w, a| {
