@@ -126,6 +126,8 @@ pub struct Volume {
     pub generation: u64,
     /// For smooth motion: how far this frame is from the previous step to this one (0..1).
     pub blend: f32,
+    /// Objects moving in the liquid: shape, centre and half sizes (metres).
+    pub objects: Vec<(String, [f32; 3], [f32; 3])>,
 }
 
 impl Volume {
@@ -582,6 +584,8 @@ pub fn scene(rect: egui::Rect, items: &[Item], cam: &Camera, light: &Light, volu
             water_radius: volume.map_or(0.0, |v| v.water_radius),
             pool: volume.is_some_and(|v| v.water_radius > 0.0),
             blend: volume.map_or(1.0, |v| v.blend),
+            objects: [(true, [0.0; 3], [0.0; 3]); 4],
+            n_objects: 0,
         };
     Some(Scene { view, uniforms: u_, unit, focal, ortho, lo, hi, l, z0, ground: [x0, y0, x1, y1] })
 }

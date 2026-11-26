@@ -13,7 +13,7 @@ use simtara_things::Things;
 use crate::view3d;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXAMPLES: [(&str, &str, &str); 14] = [
+pub const EXAMPLES: [(&str, &str, &str); 15] = [
     ("Empty universe", "A blank page with a few hints. Describe what exists, then the rules.", EMPTY),
     ("An idea spreads", "1,500 people, 3 of them know an idea. Each tells friends. No physics at all.", IDEA),
     ("Forest fire (physics + chemistry)", "Fuel, heat and oxygen. Turn oxygen, rain and ignition temperature while it burns.", include_str!("../../../examples/fire.luau")),
@@ -21,6 +21,7 @@ pub const EXAMPLES: [(&str, &str, &str); 14] = [
     ("Bouncing things (3D)", "120 balls, cubes, pyramids and ships bouncing. Turn the camera and light, change gravity and wind, shake as a human.", include_str!("../../../examples/balls3d.luau")),
     ("Smoke and wind around a building (3D)", "A real fluid in metres and seconds: wind flows around a building, a hot chimney's smoke rises and swirls in the wake.", include_str!("../../../examples/smoke.luau")),
     ("Fire plume (3D smoke and heat)", "A fire heats the air; the hot column rises, curls into a mushroom and breaks into swirls around a beam.", include_str!("../../../examples/plume.luau")),
+    ("Play in a pool: steer a ball (3D)", "Arrow keys / WASD move a ball through real water, E and Q up and down. A floating ball and a boat ride your waves.", include_str!("../../../examples/play.luau")),
     ("Water: a dam breaks (3D)", "75,000 water particles (FLIP): a wall of water crashes into a block, splashes up the far wall and settles.", include_str!("../../../examples/water.luau")),
     ("Pour a real liquid into a glass (3D)", "Real viscosity and density: honey, water, olive oil, milk, mercury... poured into a glass at real size. Change LIQUID at the top.", include_str!("../../../examples/pour.luau")),
     ("Airflow around a building (3D)", "A wind tunnel of 6,000 air cells. Smoke streaks show the air going around a building. Turn wind, viscosity and gusts.", include_str!("../../../examples/airflow.luau")),
@@ -417,6 +418,45 @@ impl BuildView {
         }
     }
 
+    /// Objects made with `keys = true` are steered from the keyboard: arrow keys (or W A S D)
+    /// move them across, Q and E down and up. The keys set the controls the object is driven by.
+    fn steer_objects(&mut self, ui: &egui::Ui) {
+        if ui.ctx().text_edit_focused() {
+            return;
+        }
+        let Some(f) = self.sim.world().get::<simtara_fields::Fluid>() else { return };
+        let mut edits: Vec<(String, f64)> = Vec::new();
+        let (l, r, fwd, back, up, down) = ui.input(|i| {
+            use egui::Key;
+            let k = |a: Key, b: Key| i.key_down(a) || i.key_down(b);
+            (k(Key::ArrowLeft, Key::A), k(Key::ArrowRight, Key::D), k(Key::ArrowUp, Key::W), k(Key::ArrowDown, Key::S), i.key_down(Key::E), i.key_down(Key::Q))
+        });
+        // move relative to the camera: "up" on the keyboard is away from the camera
+        let yaw = self.sim.world().get::<Things>().map_or(0.0, |t| t.camera.yaw.to_radians());
+        let (fx, fy) = (-(yaw.cos()) as f32, -(yaw.sin()) as f32);
+        let (rx, ry) = (fy, -fx);
+        let ax = (r as i32 - l as i32) as f32;
+        let ay = (fwd as i32 - back as i32) as f32;
+        let az = (up as i32 - down as i32) as f32;
+        for ob in f.objects.iter().filter(|o| o.keys) {
+            let v = [(ax * rx + ay * fx) * ob.speed, (ax * ry + ay * fy) * ob.speed, az * ob.speed];
+            for a in 0..3 {
+                if let simtara_fields::Num::P(name) = &ob.drive[a] {
+                    edits.push((name.clone(), v[a] as f64));
+                }
+            }
+        }
+        for (name, value) in edits {
+            let now = self.sim.world().get::<Things>().and_then(|t| t.params.get(&name)).map(|p| p.value);
+            if now != Some(value) {
+                let _ = self.sim.world_mut().call("set_param", &json!({"name": name, "value": value}));
+            }
+        }
+        if ax != 0.0 || ay != 0.0 || az != 0.0 {
+            ui.ctx().request_repaint();
+        }
+    }
+
     /// Draw the whole screen. Returns true when the user wants to go back.
     pub fn show(&mut self, ui: &mut egui::Ui, store: &Store) -> bool {
         let mut back = false;
@@ -435,7 +475,7 @@ impl BuildView {
             f.want_render = true;
             f.sun = sun;
         }
-        // Fluids compute their next step on another thread. While it is not ready, skip the tick
+        self.steer_objects(ui);        // Fluids compute their next step on another thread. While it is not ready, skip the tick
         // and keep drawing, so turning the camera stays smooth however slow the fluid is.
         let fluid_busy = self.sim.world().get::<simtara_fields::Fluid>().is_some_and(|f| f.busy());
         if self.sim.run_state() == RunState::Running && fluid_busy {
@@ -905,6 +945,7 @@ impl BuildView {
                     caustics: r.caustics.clone(),
                     liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()),
                     generation: r.generation,
+                    objects: r.objects.clone(),
                     blend: {
                         // a new step: remember when it came and how long steps take
                         if self.step_seen.0 != r.generation {

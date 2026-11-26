@@ -52,6 +52,9 @@ pub struct Uniforms {
     pub pool: bool,
     /// How far between the last two steps this frame is (0 = the older, 1 = the newest).
     pub blend: f32,
+    /// Objects in the liquid, drawn exactly: (ball?, centre, half sizes), world units. Up to 4.
+    pub objects: [(bool, [f32; 3], [f32; 3]); 4],
+    pub n_objects: u32,
 }
 
 impl Uniforms {
@@ -60,7 +63,11 @@ impl Uniforms {
         let b = |x: bool| if x { 1.0 } else { 0.0 };
         let (vs, vd) = self.volume.unwrap_or(([1.0; 3], [1; 3]));
         let cell = (0..3).map(|a| vs[a] / vd[a] as f32).fold(f32::MAX, f32::min);
-        let all: [[f32; 4]; 13] = [
+        let ob = |i: usize| {
+            let (ball, c, h) = self.objects[i];
+            [[c[0], c[1], c[2], if ball { 0.0 } else { 1.0 }], [h[0], h[1], h[2], 0.0]]
+        };
+        let all: [[f32; 4]; 21] = [
             v4(self.eye, 0.0),
             v4(self.r, 0.0),
             v4(self.u, 0.0),
@@ -73,7 +80,8 @@ impl Uniforms {
             [self.viewport[0], self.viewport[1], crate::view3d::SMOKE_PER_METRE, crate::view3d::GLOW_PER_METRE],
             [vs[0], vs[1], vs[2], cell],
             [vd[0] as f32, vd[1] as f32, vd[2] as f32, b(self.volume.is_some())],
-            [self.water_radius, b(self.pool), self.blend, 0.0],
+            [self.water_radius, b(self.pool), self.blend, self.n_objects as f32],
+            ob(0)[0], ob(0)[1], ob(1)[0], ob(1)[1], ob(2)[0], ob(2)[1], ob(3)[0], ob(3)[1],
         ];
         all.iter().flatten().flat_map(|x| x.to_le_bytes()).collect()
     }
@@ -186,7 +194,7 @@ pub struct Gpu3d {
 impl Gpu3d {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Gpu3d {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("simtara 3d"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("simtara 3d uniforms"), size: 13 * 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("simtara 3d uniforms"), size: 21 * 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("simtara 3d"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -345,6 +353,13 @@ impl Gpu3d {
         u.water_radius = volume.map_or(0.0, |v| v.water_radius);
         u.pool = volume.is_some_and(|v| v.water_radius > 0.0);
         u.blend = volume.map_or(1.0, |v| v.blend.clamp(0.0, 1.0));
+        u.n_objects = 0;
+        if let Some(v) = volume {
+            for (i, (shape, c, h)) in v.objects.iter().take(4).enumerate() {
+                u.objects[i] = (shape == "ball", *c, *h);
+                u.n_objects = i as u32 + 1;
+            }
+        }
         self.queue.write_buffer(&self.uniforms, 0, &u.bytes());
         // the fluid's pictures go to the card only when they changed (once per step, not per frame)
         let fresh = volume.is_some_and(|v| v.generation == 0 || v.generation != self.uploaded);
@@ -623,7 +638,8 @@ struct Uni {
     vp: vec4<f32>,       // picture width, height (pixels), smoke per metre, glow per metre
     vsize: vec4<f32>,    // smoke box size (metres), cell size
     vdims: vec4<f32>,    // cells along x, y, z, volume on
-    water: vec4<f32>,    // water particle radius
+    water: vec4<f32>,    // water particle radius, pool, blend, number of objects
+    objs: array<vec4<f32>, 8>, // per object: centre + kind (0 ball, 1 box), half sizes
 };
 @group(0) @binding(0) var<uniform> U: Uni;
 
@@ -901,10 +917,54 @@ fn view_ray(fc: vec2<f32>) -> array<vec3<f32>, 2> {
 // solids of a liquid scene, drawn with their depth so water in front of them hides them
 struct SolidOut { @location(0) colour: vec4<f32>, @builtin(frag_depth) depth: f32 };
 
+// where a ray first meets object i (a big number if it does not), and the normal there
+fn hit_object(o: vec3<f32>, d: vec3<f32>, i: u32) -> vec4<f32> {
+    let c = U.objs[2u * i].xyz;
+    let h = U.objs[2u * i + 1u].xyz;
+    if (U.objs[2u * i].w < 0.5) {
+        let oc = o - c;
+        let b = dot(oc, d);
+        let disc = b * b - (dot(oc, oc) - h.x * h.x);
+        if (disc < 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 1e9); }
+        let t = -b - sqrt(disc);
+        if (t < 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 1e9); }
+        return vec4<f32>(normalize(o + d * t - c), t);
+    }
+    let inv = 1.0 / select(d, vec3<f32>(1e-9), abs(d) < vec3<f32>(1e-9));
+    let ta = (c - h - o) * inv;
+    let tb = (c + h - o) * inv;
+    let tmin = min(ta, tb);
+    let tmax = max(ta, tb);
+    let t0 = max(max(tmin.x, tmin.y), tmin.z);
+    let t1 = min(min(tmax.x, tmax.y), tmax.z);
+    if (t1 < max(t0, 0.0)) { return vec4<f32>(0.0, 0.0, 0.0, 1e9); }
+    var n = vec3<f32>(-sign(d.x), 0.0, 0.0);
+    if (t0 == tmin.y) { n = vec3<f32>(0.0, -sign(d.y), 0.0); }
+    if (t0 == tmin.z) { n = vec3<f32>(0.0, 0.0, -sign(d.z)); }
+    return vec4<f32>(n, t0);
+}
+
 @fragment fn fs_solids(in: FullOut) -> SolidOut {
     let ray = view_ray(in.pos.xy);
     let o = ray[0];
     let d = ray[1];
+    // the nearest object, drawn with its exact shape (a warm yellow, easy to follow in the water)
+    var best = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+    let count = u32(U.water.w);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let hit = hit_object(o, d, i);
+        if (hit.w < best.w) { best = hit; }
+    }
+    if (best.w < 1e8) {
+        let p = o + d * best.w;
+        let k = min(U.mode.y + U.mode.z * max(dot(best.xyz, U.light.xyz), 0.0), 1.4);
+        let spec = pow(max(dot(reflect(d, best.xyz), U.light.xyz), 0.0), 40.0) * 0.4 * U.mode.z;
+        var out: SolidOut;
+        out.colour = vec4<f32>(min(vec3<f32>(0.95, 0.72, 0.22) * k + vec3<f32>(spec), vec3<f32>(1.0)), 1.0);
+        let c = project(p);
+        out.depth = clamp(c.z / c.w, 0.0, 1.0);
+        return out;
+    }
     let size = U.vsize.xyz;
     let inv = 1.0 / select(d, vec3<f32>(1e-9), abs(d) < vec3<f32>(1e-9));
     let ta = (vec3<f32>(0.0) - o) * inv;
@@ -1046,6 +1106,8 @@ mod tests {
             water_radius: 0.0,
             pool: false,
             blend: 1.0,
+            objects: [(true, [0.0; 3], [0.0; 3]); 4],
+            n_objects: 0,
         }
     }
 
@@ -1115,7 +1177,7 @@ mod tests {
         for c in 0..(n * n * n) as usize {
             data[c * 4] = 26;
         }
-        let vol = Volume { dims: [n; 3], size: [2.0; 3], data, water_radius: 0.0, caustics: None, liquid: None, generation: 0, blend: 1.0 };
+        let vol = Volume { dims: [n; 3], size: [2.0; 3], data, water_radius: 0.0, caustics: None, liquid: None, generation: 0, blend: 1.0, objects: Vec::new() };
         let mut u = camera(false);
         u.eye = [1.0, 10.0, 1.0];
         let size = [64, 64];
@@ -1164,7 +1226,7 @@ mod tests {
                 }
             }
         }
-        let vol = Volume { dims: [n; 3], size: [1.0; 3], data: vec![0; (n * n * n * 4) as usize], water_radius: 0.03, caustics: None, liquid: Some(field), generation: 0, blend: 1.0 };
+        let vol = Volume { dims: [n; 3], size: [1.0; 3], data: vec![0; (n * n * n * 4) as usize], water_radius: 0.03, caustics: None, liquid: Some(field), generation: 0, blend: 1.0, objects: Vec::new() };
         let mut u = camera(false);
         u.eye = [0.5, 4.0, 0.5];
         u.ambient = 0.5;

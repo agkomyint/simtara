@@ -7,7 +7,9 @@ struct Params {
     nx: u32, ny: u32, nz: u32, np: u32,
     dt: f32, h: f32, gravity: f32, visc: f32,
     nu: u32, nv: u32, nw: u32, nc: u32,
-    omega: f32, colour: u32, pad0: u32, pad1: u32,
+    omega: f32, colour: u32, nobj: u32, pad1: u32,
+    // up to 4 moving objects: [centre (cells), kind 0 ball 1 box], [half sizes (cells)], [velocity (m/s)]
+    obj: array<vec4<f32>, 12>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -85,8 +87,14 @@ fn cell_of(c: u32) -> vec3<u32> {
     return vec3<u32>(c % P.nx, (c / P.nx) % P.ny, c / (P.nx * P.ny));
 }
 
+// 0 = open, 1 = a fixed solid, 2 + n = moving object n
 fn is_solid_cell(i: u32, j: u32, k: u32) -> bool {
-    return solid[cidx(i, j, k)] == SOLID;
+    return solid[cidx(i, j, k)] != 0u;
+}
+
+fn object_of(i: u32, j: u32, k: u32) -> u32 {
+    let s = solid[cidx(i, j, k)];
+    return select(0u, s - 1u, s >= 2u);
 }
 
 fn fl(i: u32, j: u32, k: u32) -> u32 {
@@ -153,7 +161,7 @@ fn w1(t: f32, o: u32) -> f32 {
     }
     if (i < P.nc) {
         atomicStore(&rho[i], 0);
-        flags[i] = select(AIR, SOLID, solid[i] == SOLID);
+        flags[i] = select(AIR, SOLID, solid[i] != 0u);
     }
 }
 
@@ -193,7 +201,7 @@ fn w1(t: f32, o: u32) -> f32 {
     }
     let ci = min(vec3<u32>(x), vec3<u32>(P.nx - 1u, P.ny - 1u, P.nz - 1u));
     let cc = cidx(ci.x, ci.y, ci.z);
-    if (solid[cc] != SOLID) {
+    if (solid[cc] == 0u) {
         flags[cc] = FLUID;
     }
 }
@@ -261,10 +269,75 @@ fn wall_face(a: vec4<u32>) -> bool {
     return is_solid_cell(a.y, a.z, a.w - 1u) || is_solid_cell(a.y, a.z, a.w);
 }
 
+// a face next to a moving object moves with it (1 + object, 0 = none)
+fn face_object(a: vec4<u32>) -> u32 {
+    var lo = 0u;
+    var hi = 0u;
+    if (a.x == 0u) {
+        if (a.y > 0u) { lo = object_of(a.y - 1u, a.z, a.w); }
+        if (a.y < P.nx) { hi = object_of(a.y, a.z, a.w); }
+    } else if (a.x == 1u) {
+        if (a.z > 0u) { lo = object_of(a.y, a.z - 1u, a.w); }
+        if (a.z < P.ny) { hi = object_of(a.y, a.z, a.w); }
+    } else {
+        if (a.w > 0u) { lo = object_of(a.y, a.z, a.w - 1u); }
+        if (a.w < P.nz) { hi = object_of(a.y, a.z, a.w); }
+    }
+    return select(hi, lo, lo > 0u);
+}
+
+fn wall_value(a: vec4<u32>) -> f32 {
+    let o = face_object(a);
+    if (o > 0u) { return P.obj[3u * (o - 1u) + 2u][a.x]; }
+    return 0.0;
+}
+
 @compute @workgroup_size(64) fn enforce(@builtin(global_invocation_id) id: vec3<u32>) {
     let f = gid(id);
     if (f >= nf()) { return; }
-    if (wall_face(face(f))) { vel[f] = 0.0; }
+    let a = face(f);
+    if (wall_face(a)) { vel[f] = wall_value(a); }
+}
+
+// particles a moving object has run into go to its surface and move with it
+@compute @workgroup_size(64) fn push_out(@builtin(global_invocation_id) id: vec3<u32>) {
+    let p = gid(id);
+    if (p >= P.np || P.nobj == 0u) { return; }
+    var x = ppos[p].xyz;
+    var v = pvel[p].xyz;
+    for (var o = 0u; o < P.nobj; o = o + 1u) {
+        let c = P.obj[3u * o];
+        let hs = P.obj[3u * o + 1u].xyz;
+        let ov = P.obj[3u * o + 2u].xyz;
+        let d = x - c.xyz;
+        var n = vec3<f32>(0.0);
+        var q = x;
+        var inside = false;
+        if (c.w < 0.5) {
+            let l = length(d);
+            if (l < hs.x) {
+                inside = true;
+                n = select(vec3<f32>(0.0, 0.0, 1.0), d / l, l > 1e-6);
+                q = c.xyz + n * hs.x * 1.001;
+            }
+        } else if (all(abs(d) <= hs)) {
+            inside = true;
+            let gap = hs - abs(d);
+            var a = 0u;
+            if (gap.y < gap[a]) { a = 1u; }
+            if (gap.z < gap[a]) { a = 2u; }
+            let s = select(-1.0, 1.0, d[a] >= 0.0);
+            q[a] = c[a] + s * hs[a] * 1.001;
+            n[a] = s;
+        }
+        if (inside) {
+            x = q;
+            let rel = dot(v - ov, n);
+            if (rel < 0.0) { v = v - rel * n; }
+        }
+    }
+    ppos[p] = vec4<f32>(x, 0.0);
+    pvel[p] = vec4<f32>(v, 0.0);
 }
 
 @compute @workgroup_size(64) fn gravity(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -272,7 +345,7 @@ fn wall_face(a: vec4<u32>) -> bool {
     if (f >= nf()) { return; }
     let a = face(f);
     if (a.x == 2u) { vel[f] = vel[f] - P.gravity * P.dt; }
-    if (wall_face(a)) { vel[f] = 0.0; }
+    if (wall_face(a)) { vel[f] = wall_value(a); }
 }
 
 fn touches_liquid(a: vec4<u32>) -> bool {
@@ -303,7 +376,8 @@ fn touches_liquid(a: vec4<u32>) -> bool {
 @compute @workgroup_size(64) fn viscous_back(@builtin(global_invocation_id) id: vec3<u32>) {
     let f = gid(id);
     if (f >= nf()) { return; }
-    vel[f] = select(vel2[f], 0.0, wall_face(face(f)));
+    let a = face(f);
+    vel[f] = select(vel2[f], wall_value(a), wall_face(a));
 }
 
 // ---------------------------------------------------------------- pressure: build, solve, apply
@@ -319,7 +393,7 @@ fn theta(c: u32, n: u32) -> f32 {
 }
 
 fn inside(ok: bool, n: u32) -> bool {
-    return !ok || flags[n] == FLUID || solid[n] == SOLID;
+    return !ok || flags[n] == FLUID || solid[n] != 0u;
 }
 
 @compute @workgroup_size(64) fn cells(@builtin(global_invocation_id) id: vec3<u32>) {

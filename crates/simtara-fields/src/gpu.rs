@@ -12,10 +12,27 @@ use std::sync::{Mutex, OnceLock};
 const SHADER: &str = include_str!("gpu_liquid.wgsl");
 const BINS: u64 = 48;
 const ROW: u32 = 65535;
-const KERNELS: [&str; 21] = [
+const KERNELS: [&str; 22] = [
+    "push_out",
     "measure", "pack",
     "clear", "p2g", "normalize", "extrapolate", "copy_back", "enforce", "gravity", "viscous", "viscous_back", "cells", "sor", "gradient", "mark_touch", "g2p", "advect", "clear_bins", "bin", "separate", "copy_pos",
 ];
+
+/// A moving object as the GPU sees it: centre and half sizes in cells, velocity in m/s.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuObject {
+    pub centre: [f32; 3],
+    pub half: [f32; 3],
+    pub vel: [f32; 3],
+    pub ball: bool,
+}
+
+impl GpuObject {
+    pub fn new(o: &crate::Object, cell: f32) -> GpuObject {
+        let ball = o.shape == "ball";
+        GpuObject { centre: o.pos.map(|x| x / cell), half: if ball { [o.half[0] / cell; 3] } else { o.half.map(|x| x / cell) }, vel: o.vel, ball }
+    }
+}
 
 /// What one tick asks of the GPU.
 pub struct Job<'a> {
@@ -29,6 +46,9 @@ pub struct Job<'a> {
     pub visc_steps: usize,
     pub sweeps: usize,
     pub solid: &'a [u8],
+    /// 1 + object index per cell (0 = none), and the objects themselves.
+    pub which: &'a [u8],
+    pub objects: Vec<GpuObject>,
     pub particles: &'a mut Vec<[f32; 6]>,
     pub affine: &'a mut Vec<[f32; 9]>,
     pub pressure: &'a mut Vec<f32>,
@@ -114,7 +134,7 @@ impl Gpu {
             .enumerate()
             .map(|(i, s)| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(&format!("simtara liquid {}", i + 1)), size: (*s).max(16), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }))
             .collect();
-        let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.params, offset: 0, size: wgpu::BufferSize::new(64) }) }];
+        let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.params, offset: 0, size: wgpu::BufferSize::new(256) }) }];
         for (i, b) in bufs.iter().enumerate() {
             entries.push(wgpu::BindGroupEntry { binding: i as u32 + 1, resource: b.as_entire_binding() });
         }
@@ -133,8 +153,14 @@ fn params_block(d: Dims, np: u32, j: &Job, colour: u32, omega: f32) -> Vec<u8> {
     let u = |x: u32| x.to_le_bytes();
     let f = |x: f32| x.to_le_bytes();
     let mut out = Vec::with_capacity(64);
-    for b in [u(d.nx as u32), u(d.ny as u32), u(d.nz as u32), u(np), f(j.sdt), f(j.h), f(j.gravity), f(j.visc), u(nu), u(nv), u(nw), u(d.cells() as u32), f(omega), u(colour), u(0), u(0)] {
+    for b in [u(d.nx as u32), u(d.ny as u32), u(d.nz as u32), u(np), f(j.sdt), f(j.h), f(j.gravity), f(j.visc), u(nu), u(nv), u(nw), u(d.cells() as u32), f(omega), u(colour), u(j.objects.len().min(4) as u32), u(0)] {
         out.extend_from_slice(&b);
+    }
+    for i in 0..4 {
+        let o = j.objects.get(i).copied().unwrap_or(GpuObject { centre: [0.0; 3], half: [0.0; 3], vel: [0.0; 3], ball: true });
+        for x in [o.centre[0], o.centre[1], o.centre[2], if o.ball { 0.0 } else { 1.0 }, o.half[0], o.half[1], o.half[2], 0.0, o.vel[0], o.vel[1], o.vel[2], 0.0] {
+            out.extend_from_slice(&f(x));
+        }
     }
     out
 }
@@ -165,6 +191,11 @@ pub fn step(j: Job) -> Result<f32, String> {
     g.queue.write_buffer(&g.params, 0, &pb);
     let q = &g.queue;
     let on_card = g.resident == (j.generation, np);
+    // solids (with the moving objects) change every tick when there are objects
+    if !on_card || !j.objects.is_empty() {
+        let solid: Vec<u32> = j.solid.par_iter().zip(j.which.par_iter()).map(|(f, w)| if *w > 0 { 1 + *w as u32 } else { (*f == SOLID) as u32 }).collect();
+        q.write_buffer(&s.bufs[8], 0, bytemuck::cast_slice(&solid));
+    }
     if !on_card {
         let pos: Vec<[f32; 4]> = j.particles.par_iter().map(|p| [p[0], p[1], p[2], 0.0]).collect();
         let vel: Vec<[f32; 4]> = j.particles.par_iter().map(|p| [p[3], p[4], p[5], 0.0]).collect();
@@ -172,8 +203,6 @@ pub fn step(j: Job) -> Result<f32, String> {
         q.write_buffer(&s.bufs[0], 0, bytemuck::cast_slice(&pos));
         q.write_buffer(&s.bufs[1], 0, bytemuck::cast_slice(&vel));
         q.write_buffer(&s.bufs[2], 0, bytemuck::cast_slice(&aff));
-        let solid: Vec<u32> = j.solid.par_iter().map(|f| (*f == SOLID) as u32).collect();
-        q.write_buffer(&s.bufs[8], 0, bytemuck::cast_slice(&solid));
         if j.pressure.len() == nc {
             q.write_buffer(&s.bufs[10], 0, bytemuck::cast_slice(j.pressure));
         } else {
@@ -182,7 +211,7 @@ pub fn step(j: Job) -> Result<f32, String> {
     }
 
     // a second bind group whose params point at the "black" block
-    let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &g.params, offset: 256, size: wgpu::BufferSize::new(64) }) }];
+    let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &g.params, offset: 256, size: wgpu::BufferSize::new(256) }) }];
     for (i, b) in s.bufs.iter().enumerate() {
         entries.push(wgpu::BindGroupEntry { binding: i as u32 + 1, resource: b.as_entire_binding() });
     }
@@ -228,6 +257,7 @@ pub fn step(j: Job) -> Result<f32, String> {
             run("enforce", nf, red);
             run("g2p", np, red);
             run("advect", np, red);
+            run("push_out", np, red);
             run("clear_bins", nc, red);
             run("bin", np, red);
             run("separate", np, red);

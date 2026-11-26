@@ -248,6 +248,38 @@ pub fn enforce(mac: &mut Mac, flags: &[u8], sides: Sides) {
     });
 }
 
+/// Faces next to (or inside) a moving object take its velocity: it is a wall that moves, so the
+/// liquid in front of it is pushed and the liquid behind follows. `which` = 1 + object index
+/// per cell (0 = none).
+pub fn apply_objects(mac: &mut Mac, which: &[u8], vel: &[[f32; 3]]) {
+    if vel.is_empty() {
+        return;
+    }
+    let d = mac.d;
+    let obj = |i: usize, j: usize, k: usize| which[d.c(i, j, k)];
+    for (axis, dims) in [(0usize, d.ud()), (1, d.vd()), (2, d.wd())] {
+        let arr = match axis {
+            0 => &mut mac.u,
+            1 => &mut mac.v,
+            _ => &mut mac.w,
+        };
+        arr.par_chunks_mut(dims[0] * dims[1]).enumerate().for_each(|(k, slab)| {
+            for j in 0..dims[1] {
+                for i in 0..dims[0] {
+                    let (a, b) = match axis {
+                        0 => ((i > 0).then(|| obj(i - 1, j, k)), (i < d.nx).then(|| obj(i, j, k))),
+                        1 => ((j > 0).then(|| obj(i, j - 1, k)), (j < d.ny).then(|| obj(i, j, k))),
+                        _ => ((k > 0).then(|| obj(i, j, k - 1)), (k < d.nz).then(|| obj(i, j, k))),
+                    };
+                    if let Some(o) = a.filter(|x| *x > 0).or(b.filter(|x| *x > 0)) {
+                        slab[i + dims[0] * j] = vel[o as usize - 1][axis];
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Make the flow divergence-free in every FLUID cell: air neither piles up nor disappears.
 /// SOLID neighbours are walls, AIR cells and open sides hold zero pressure. `p` is the
 /// pressure (scaled, warm-started from the last step). Returns the largest divergence left.

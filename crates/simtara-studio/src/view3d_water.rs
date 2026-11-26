@@ -190,6 +190,34 @@ fn box_span(o: vec3<f32>, d: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(t0, t1);
 }
 
+// distance along a ray to the nearest object (a big number if none): the picture of the scene
+// is only looked up through the water where no object stands in front of the water there
+fn object_distance(o: vec3<f32>, d: vec3<f32>) -> f32 {
+    var best = 1e9;
+    let count = u32(U.water.w);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let c = U.objs[2u * i].xyz;
+        let h = U.objs[2u * i + 1u].xyz;
+        if (U.objs[2u * i].w < 0.5) {
+            let oc = o - c;
+            let b = dot(oc, d);
+            let disc = b * b - (dot(oc, oc) - h.x * h.x);
+            if (disc >= 0.0) {
+                let t = -b - sqrt(disc);
+                if (t > 0.0) { best = min(best, t); }
+            }
+        } else {
+            let inv = 1.0 / select(d, vec3<f32>(1e-9), abs(d) < vec3<f32>(1e-9));
+            let ta = (c - h - o) * inv;
+            let tb = (c + h - o) * inv;
+            let t0 = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
+            let t1 = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
+            if (t1 >= max(t0, 0.0)) { best = min(best, max(t0, 0.0)); }
+        }
+    }
+    return best;
+}
+
 struct WaterOut { @location(0) colour: vec4<f32>, @builtin(frag_depth) depth: f32 };
 
 @fragment fn fs_liquid(in: FullW) -> WaterOut {
@@ -266,7 +294,14 @@ struct WaterOut { @location(0) colour: vec4<f32>, @builtin(frag_depth) depth: f3
     thick = s + step;
     let out = p + bent * thick;
     let cq = project(out);
-    let uv = vec2<f32>(cq.x / cq.w * 0.5 + 0.5, 0.5 - cq.y / cq.w * 0.5);
+    var uv = vec2<f32>(cq.x / cq.w * 0.5 + 0.5, 0.5 - cq.y / cq.w * 0.5);
+    // if an object stands between the eye and the water at that spot, it is not behind the water:
+    // look straight through instead
+    let look = select(normalize(out - U.eye.xyz), U.f.xyz, U.mode.x > 0.5);
+    let look_from = select(U.eye.xyz, out - U.f.xyz * dot(out - U.eye.xyz, U.f.xyz), U.mode.x > 0.5);
+    if (object_distance(look_from, look) < length(p - look_from)) {
+        uv = in.pos.xy / U.vp.xy;
+    }
     let behind = textureSampleLevel(scene_tex, liq_smp, clamp(uv, vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb;
     // Beer-Lambert absorption, and light scattered back out of the water body
     let absorb = vec3<f32>(2.0, 0.75, 0.5);

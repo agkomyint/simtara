@@ -178,6 +178,60 @@ pub struct Emitter {
     carry: f32,
 }
 
+/// A solid object that moves through a liquid: a ball or a box. It pushes the water (its cells
+/// are a moving wall), and a floating one is pushed back (buoyancy, drag). Up to 4 per fluid.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Object {
+    pub name: String,
+    /// "ball" or "box"
+    pub shape: String,
+    /// Centre, metres.
+    pub pos: [f32; 3],
+    /// Velocity, m/s.
+    pub vel: [f32; 3],
+    /// Ball: radius in [0]; box: half sizes, metres.
+    pub half: [f32; 3],
+    /// The velocity it is driven at (numbers or controls); for a floating object, a push.
+    pub drive: [Num; 3],
+    /// Floats (buoyancy, gravity, drag) instead of moving exactly as driven.
+    pub float: bool,
+    /// kg/m³ (a floating object sinks when denser than the liquid).
+    pub density: f32,
+    /// Steered with the arrow keys in Studio (sets the drive controls).
+    pub keys: bool,
+    /// Top speed when steered, m/s.
+    pub speed: f32,
+}
+
+impl Object {
+    fn volume(&self) -> f32 {
+        if self.shape == "ball" { 4.0 / 3.0 * std::f32::consts::PI * self.half[0].powi(3) } else { 8.0 * self.half[0] * self.half[1] * self.half[2] }
+    }
+    /// Is the point (metres) inside?
+    pub fn contains(&self, p: [f32; 3]) -> bool {
+        let d = [p[0] - self.pos[0], p[1] - self.pos[1], p[2] - self.pos[2]];
+        if self.shape == "ball" { d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= self.half[0] * self.half[0] } else { (0..3).all(|a| d[a].abs() <= self.half[a]) }
+    }
+    /// Nearest point on the surface (metres) and the outward normal, for a point inside.
+    fn surface(&self, p: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+        let d = [p[0] - self.pos[0], p[1] - self.pos[1], p[2] - self.pos[2]];
+        if self.shape == "ball" {
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+            let n = [d[0] / l, d[1] / l, d[2] / l];
+            let r = self.half[0] * 1.001;
+            ([self.pos[0] + n[0] * r, self.pos[1] + n[1] * r, self.pos[2] + n[2] * r], n)
+        } else {
+            let a = (0..3).min_by(|&a, &b| (self.half[a] - d[a].abs()).partial_cmp(&(self.half[b] - d[b].abs())).unwrap()).unwrap();
+            let mut q = p;
+            let mut n = [0.0; 3];
+            let s = if d[a] >= 0.0 { 1.0 } else { -1.0 };
+            q[a] = self.pos[a] + s * self.half[a] * 1.001;
+            n[a] = s;
+            (q, n)
+        }
+    }
+}
+
 /// A measurement over the whole fluid or a box of it (metres).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FieldMetric {
@@ -214,6 +268,9 @@ pub struct Fluid {
     pub affine: Vec<[f32; 9]>,
     pub emitters: Vec<Emitter>,
     pub metrics: Vec<FieldMetric>,
+    /// Objects moving through the liquid.
+    #[serde(default)]
+    pub objects: Vec<Object>,
     /// Which copy of the particles the graphics card holds (changes whenever the CPU changes them).
     #[serde(skip)]
     gpu_generation: u64,
@@ -260,6 +317,8 @@ pub struct RenderData {
     pub spray: Vec<[f32; 3]>,
     /// Light focused on the floor: width, height, brightness / 3.
     pub caustics: Option<(u32, u32, Vec<u8>)>,
+    /// Objects: shape, centre and half sizes (metres), to draw exactly.
+    pub objects: Vec<(String, [f32; 3], [f32; 3])>,
 }
 
 static RENDER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -370,6 +429,7 @@ impl Fluid {
             affine: Vec::new(),
             emitters: Vec::new(),
             metrics: old.metrics,
+            objects: Vec::new(),
             use_gpu: old.use_gpu || old.d.is_none(),
             gpu_generation: 0,
             seconds: 0.0,
@@ -545,6 +605,123 @@ impl Fluid {
         self.kind == Kind::Water && self.use_gpu && gpu::available()
     }
 
+    /// Solid cells with the objects in them (`SOLID`), and which object is in each cell
+    /// (0 = none, 1 + index), for this moment.
+    fn live_solids(&self) -> (Vec<u8>, Vec<u8>) {
+        let d = self.dims();
+        let h = self.cell;
+        let mut solid = self.solid.clone();
+        let mut which = vec![0u8; d.cells()];
+        for (o, ob) in self.objects.iter().enumerate().take(4) {
+            let ext = [ob.half[0], if ob.shape == "ball" { ob.half[0] } else { ob.half[1] }, if ob.shape == "ball" { ob.half[0] } else { ob.half[2] }];
+            let lo = |a: usize| (((ob.pos[a] - ext[a]) / h).floor().max(0.0)) as usize;
+            let hi = |a: usize, n: usize| (((ob.pos[a] + ext[a]) / h).ceil().max(0.0) as usize).min(n);
+            for k in lo(2)..hi(2, d.nz) {
+                for j in lo(1)..hi(1, d.ny) {
+                    for i in lo(0)..hi(0, d.nx) {
+                        if ob.contains([(i as f32 + 0.5) * h, (j as f32 + 0.5) * h, (k as f32 + 0.5) * h]) {
+                            let c = d.c(i, j, k);
+                            solid[c] = SOLID;
+                            which[c] = o as u8 + 1;
+                        }
+                    }
+                }
+            }
+        }
+        (solid, which)
+    }
+
+    /// Move the objects over `dt`: driven ones at their drive velocity, floating ones by
+    /// gravity, buoyancy (Archimedes: the weight of the liquid they push aside) and drag.
+    fn move_objects(&mut self, dt: f32, gravity: f32, params: &BTreeMap<String, Param>) {
+        if self.objects.is_empty() {
+            return;
+        }
+        let d = self.dims();
+        let h = self.cell;
+        let ext = self.extent();
+        let rho_l = self.settings.density.max(1.0);
+        let per_particle = h.powi(3) / liquid::PER_CELL;
+        for ob in self.objects.iter_mut() {
+            let drive = [ob.drive[0].get(params), ob.drive[1].get(params), ob.drive[2].get(params)];
+            if ob.float {
+                // the liquid around it: how deep it is there and how it moves (a ring round the object)
+                let r = ob.half[0].max(ob.half[1]);
+                let (r0, r1) = (r, r * 1.8);
+                let (mut n, mut v) = (0.0f32, [0.0f32; 3]);
+                for p in &self.particles {
+                    let (x, y) = (p[0] * h - ob.pos[0], p[1] * h - ob.pos[1]);
+                    let dd = x * x + y * y;
+                    if dd >= r0 * r0 && dd <= r1 * r1 {
+                        n += 1.0;
+                        v[0] += p[3];
+                        v[1] += p[4];
+                        v[2] += p[5];
+                    }
+                }
+                let area = std::f32::consts::PI * (r1 * r1 - r0 * r0);
+                let level = n * per_particle / area;
+                let water_v = if n > 0.0 { [v[0] / n, v[1] / n, v[2] / n] } else { [0.0; 3] };
+                // how much of it is under the water line
+                let height = if ob.shape == "ball" { 2.0 * ob.half[0] } else { 2.0 * ob.half[2] };
+                let bottom = ob.pos[2] - height / 2.0;
+                let x = ((level - bottom) / height).clamp(0.0, 1.0);
+                let sub = if ob.shape == "ball" { x * x * (3.0 - 2.0 * x) } else { x };
+                let vol = ob.volume();
+                let mass = ob.density.max(1.0) * vol;
+                let mut acc = [0.0, 0.0, -gravity + rho_l * vol * sub * gravity / mass];
+                // drag towards the water's motion where it is wet, a little air drag elsewhere
+                let k = 3.0 * sub + 0.05;
+                for a in 0..3 {
+                    acc[a] += k * (water_v[a] - ob.vel[a]) + drive[a] * 2.0 * sub.max(0.2);
+                }
+                for a in 0..3 {
+                    ob.vel[a] += acc[a] * dt;
+                }
+            } else {
+                ob.vel = drive;
+            }
+            // stay inside the tank
+            let e = if ob.shape == "ball" { [ob.half[0]; 3] } else { ob.half };
+            for a in 0..3 {
+                let next = ob.pos[a] + ob.vel[a] * dt;
+                let (lo, hi) = (e[a] + h * 0.5, ext[a] - e[a] - h * 0.5);
+                if next < lo || next > hi {
+                    ob.vel[a] = 0.0;
+                }
+                ob.pos[a] = next.clamp(lo, hi.max(lo));
+            }
+        }
+        let _ = d;
+    }
+
+    /// Particles inside an object (it moved onto them) go to its surface and move with it.
+    fn push_out_of_objects(&mut self) {
+        if self.objects.is_empty() {
+            return;
+        }
+        let h = self.cell;
+        let objects = &self.objects;
+        self.particles.par_iter_mut().for_each(|p| {
+            let x = [p[0] * h, p[1] * h, p[2] * h];
+            for ob in objects {
+                if ob.contains(x) {
+                    let (q, n) = ob.surface(x);
+                    p[0] = q[0] / h;
+                    p[1] = q[1] / h;
+                    p[2] = q[2] / h;
+                    // no faster into it than it moves
+                    let rel = (p[3] - ob.vel[0]) * n[0] + (p[4] - ob.vel[1]) * n[1] + (p[5] - ob.vel[2]) * n[2];
+                    if rel < 0.0 {
+                        p[3] -= rel * n[0];
+                        p[4] -= rel * n[1];
+                        p[5] -= rel * n[2];
+                    }
+                }
+            }
+        });
+    }
+
     fn step_water(&mut self, r: &Resolved, params: &BTreeMap<String, Param>) {
         let d = self.dims();
         let h = self.cell;
@@ -554,6 +731,10 @@ impl Fluid {
         let vmax = self.particles.par_iter().map(|p| p[3].abs().max(p[4].abs()).max(p[5].abs())).reduce(|| 0.0, f32::max);
         let subs = ((vmax * self.dt / h).ceil() as usize).clamp(1, 6);
         let sdt = self.dt / subs as f32;
+        // objects move once per tick; the solid cells (with them) stay fixed for its steps
+        self.move_objects(self.dt, r.gravity, params);
+        let (live, which) = self.live_solids();
+        let obj_vel: Vec<[f32; 3]> = self.objects.iter().map(|o| o.vel).collect();
         if self.on_gpu() {
             let before = self.particles.len();
             for _ in 0..subs {
@@ -574,7 +755,9 @@ impl Fluid {
                 visc: if visc_steps > 0 { alpha / visc_steps as f32 } else { 0.0 },
                 visc_steps,
                 sweeps: r.iterations * 3,
-                solid: &self.solid,
+                solid: &live,
+                which: &which,
+                objects: self.objects.iter().take(4).map(|o| gpu::GpuObject::new(o, h)).collect(),
                 particles: &mut self.particles,
                 affine: &mut self.affine,
                 pressure: &mut self.pressure,
@@ -594,12 +777,13 @@ impl Fluid {
         // the CPU is about to change the particles: the card's copy is out of date
         self.gpu_generation = 0;
         let sides = Sides { open_top: false, open_xmax: false, inflow: None };
+        self.push_out_of_objects();
         for _ in 0..subs {
             self.emit_water(sdt, params);
             self.affine.resize(self.particles.len(), [0.0; 9]);
             // particles -> grid (APIC)
             let (mut mac, known) = liquid::p2g(&self.particles, &self.affine, d);
-            let mut flags = self.solid.clone();
+            let mut flags = live.clone();
             for f in flags.iter_mut() {
                 if *f != SOLID {
                     *f = AIR;
@@ -616,16 +800,18 @@ impl Fluid {
             extrapolate(&mut mac.v, &mut kv, d.vd(), 2);
             extrapolate(&mut mac.w, &mut kw, d.wd(), 2);
             enforce(&mut mac, &flags, sides);
+            grid::apply_objects(&mut mac, &which, &obj_vel);
             for w in mac.w.iter_mut() {
                 *w -= r.gravity * sdt;
             }
             enforce(&mut mac, &flags, sides);
+            grid::apply_objects(&mut mac, &which, &obj_vel);
             if r.viscosity > 0.0 {
                 viscous(&mut mac, &flags, sides, r.viscosity * sdt / (h * h));
             }
             // incompressible, and back towards the rest density where particles drifted
             let rho = liquid::density(&self.particles, d);
-            let target = liquid::volume_target(&rho, &flags, &self.solid, d, h, sdt);
+            let target = liquid::volume_target(&rho, &flags, &live, d, h, sdt);
             let fill: Vec<f32> = rho.iter().map(|x| x / liquid::PER_CELL).collect();
             self.divergence = grid::project_with(&mut mac, &flags, sides, &mut self.pressure, r.iterations, Some(&target), Some(&fill));
             self.last_dt = sdt;
@@ -650,10 +836,11 @@ impl Fluid {
                 extrapolate(arr, &mut ok, dims, 3);
             }
             enforce(&mut mac, &flags, sides);
+            grid::apply_objects(&mut mac, &which, &obj_vel);
             // grid -> particles (APIC), then move them through the new flow
             liquid::g2p(&mac, &mut self.particles, &mut self.affine);
             let k_cells = sdt / h;
-            let solid = &self.solid;
+            let solid = &live;
             self.particles.par_iter_mut().for_each(|p| {
                 let x = [p[0], p[1], p[2]];
                 let v0 = mac.vel(x);
@@ -677,7 +864,8 @@ impl Fluid {
                 p[1] = pos[1];
                 p[2] = pos[2];
             });
-            liquid::separate(&mut self.particles, &self.solid, d, 1);
+            self.push_out_of_objects();
+            liquid::separate(&mut self.particles, &live, d, 1);
             self.mac = Some(mac);
         }
     }
@@ -838,6 +1026,11 @@ impl Fluid {
                 out.push(("water.filled_m3".into(), rho.iter().zip(&self.solid).filter(|(_, s)| **s != SOLID).map(|(r, _)| (*r / liquid::PER_CELL).min(1.0) as f64).sum::<f64>() * h.powi(3)));
                 if n > 0.0 {
                     out.push(("water.mean_height_m".into(), self.particles.iter().map(|p| p[2] as f64).sum::<f64>() / n * h));
+                    for ob in &self.objects {
+                        out.push((format!("{}.x_m", ob.name), ob.pos[0] as f64));
+                        out.push((format!("{}.height_m", ob.name), ob.pos[2] as f64));
+                        out.push((format!("{}.speed_m_s", ob.name), (ob.vel[0] * ob.vel[0] + ob.vel[1] * ob.vel[1] + ob.vel[2] * ob.vel[2]).sqrt() as f64));
+                    }
                     out.push(("water.centre_x_m".into(), self.particles.iter().map(|p| p[0] as f64).sum::<f64>() / n * h));
                     out.push(("water.front_m".into(), self.particles.iter().map(|p| p[0]).fold(0.0f32, f32::max) as f64 * h));
                     out.push(("fluid.fastest_m_s".into(), self.particles.iter().map(|p| (p[3] * p[3] + p[4] * p[4] + p[5] * p[5]).sqrt()).fold(0.0f32, f32::max) as f64));
@@ -981,9 +1174,24 @@ impl Fluid {
         self.render = Some(std::sync::Arc::new(RenderData {
             generation: RENDER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rgba: self.volume_rgba(),
-            liquid: if water { self.liquid_field() } else { Vec::new() },
+            liquid: if water {
+                // no water inside an object: the field there is spread from the water around it
+                let mut field = self.liquid_field();
+                if !self.objects.is_empty() {
+                    let (_, which) = self.live_solids();
+                    for (f, w) in field.iter_mut().zip(which) {
+                        if w > 0 {
+                            *f = 0.0;
+                        }
+                    }
+                }
+                field
+            } else {
+                Vec::new()
+            },
             spray,
             caustics: water.then(|| self.caustics(self.sun, 3)),
+            objects: self.objects.iter().map(|o| (o.shape.clone(), o.pos, o.half)).collect(),
         }));
     }
 
@@ -1318,6 +1526,62 @@ fn register_commands(w: &mut World) {
         }
         let b = floats(a, "box", 6)?.ok_or("water needs box = {x0, y0, z0, x1, y1, z1} (metres)")?;
         Ok(json!(f.add_water([b[0].min(b[3]), b[1].min(b[4]), b[2].min(b[5])], [b[0].max(b[3]), b[1].max(b[4]), b[2].max(b[5])])))
+    });
+    // object{name, shape = "ball" | "box", at = {x, y, z}, radius = 0.1 | size = {sx, sy, sz},
+    //        velocity = {vx, vy, vz} (numbers or controls), float = false, density = 500, keys = true, speed = 1}
+    w.register_command("object", |w, a| {
+        let f = fluid_mut(w)?;
+        if f.kind != Kind::Water {
+            return Err("objects move through liquids: use fluid{kind = \"water\", ...}".into());
+        }
+        if f.objects.len() >= 4 {
+            return Err("at most 4 objects per fluid".into());
+        }
+        let shape = a.get("shape").and_then(Value::as_str).unwrap_or("ball").to_string();
+        let half = match shape.as_str() {
+            "ball" => {
+                let r = a.get("radius").and_then(Value::as_f64).ok_or("a ball needs radius (metres)")? as f32;
+                [r, r, r]
+            }
+            "box" => {
+                let s = floats(a, "size", 3)?.ok_or("a box needs size = {sx, sy, sz} (metres)")?;
+                [s[0] / 2.0, s[1] / 2.0, s[2] / 2.0]
+            }
+            other => return Err(format!("shape '{other}': use \"ball\" or \"box\"")),
+        };
+        let at = floats(a, "at", 3)?.ok_or("object needs at = {x, y, z} (metres)")?;
+        let drive = match a.get("velocity") {
+            None | Some(Value::Null) => [Num::N(0.0), Num::N(0.0), Num::N(0.0)],
+            Some(Value::Array(v)) if v.len() == 3 => {
+                let one = |x: &Value| match x {
+                    Value::Number(n) => Ok(Num::N(n.as_f64().unwrap_or(0.0))),
+                    Value::String(s) => Ok(Num::P(s.clone())),
+                    _ => Err("velocity parts must be numbers or control names".to_string()),
+                };
+                [one(&v[0])?, one(&v[1])?, one(&v[2])?]
+            }
+            Some(_) => return Err("velocity must be {vx, vy, vz} in m/s".into()),
+        };
+        let name = a.get("name").and_then(Value::as_str).unwrap_or("object").to_string();
+        f.objects.push(Object {
+            name,
+            shape,
+            pos: [at[0], at[1], at[2]],
+            vel: [0.0; 3],
+            half,
+            drive,
+            float: a.get("float").and_then(Value::as_bool).unwrap_or(false),
+            density: a.get("density").and_then(Value::as_f64).unwrap_or(500.0) as f32,
+            keys: a.get("keys").and_then(Value::as_bool).unwrap_or(false),
+            speed: a.get("speed").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+        });
+        let o = f.objects.last().unwrap().clone();
+        // the water where it starts is pushed aside: those particles go
+        let h = f.cell;
+        f.particles.retain(|p| !o.contains([p[0] * h, p[1] * h, p[2] * h]));
+        f.affine.clear();
+        f.gpu_generation = 0;
+        Ok(json!(f.objects.len()))
     });
     // fluid_metric{name, field = "smoke" | "temp" | "speed" | "water", op = "sum" | "mean" | "max" | "count", box = {...}?}
     w.register_command("fluid_metric", |w, a| {
@@ -1682,6 +1946,51 @@ mod tests {
         let t = std::time::Instant::now();
         let _ = f.clone();
         eprintln!("clone for the background step: {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    #[test]
+    fn objects_push_water_and_float_or_sink_by_their_density() {
+        for backend in ["cpu", "gpu"] {
+            if backend == "gpu" && !gpu::available() {
+                continue;
+            }
+            // a paddle (box) driven through still water pushes it along
+            let mut s = sim();
+            call(&mut s, "fluid", json!({"kind": "water", "backend": backend, "size": [40, 8, 16], "cell": 0.025, "dt": 0.01}));
+            call(&mut s, "water", json!({"box": [0, 0, 0, 1.0, 0.2, 0.15]}));
+            let x0 = s.collect_metrics()["water.centre_x_m"];
+            call(&mut s, "object", json!({"name": "paddle", "shape": "box", "at": [0.1, 0.1, 0.1], "size": [0.05, 0.2, 0.2], "velocity": [1.0, 0, 0]}));
+            s.advance(40);
+            let m = s.collect_metrics();
+            assert!(m["paddle.x_m"] > 0.4, "{backend}: the paddle moved: {m:?}");
+            assert!(m["water.centre_x_m"] > x0 + 0.05, "{backend}: water pushed ahead of it: {x0} -> {}", m["water.centre_x_m"]);
+            let h = 0.025;
+            let f = s.world().get::<Fluid>().unwrap();
+            let ob = &f.objects[0];
+            let inside = f.particles.iter().filter(|p| {
+                let q = [p[0] * h - ob.pos[0], p[1] * h - ob.pos[1], p[2] * h - ob.pos[2]];
+                q[0].abs() < ob.half[0] * 0.8 && q[1].abs() < ob.half[1] * 0.8 && q[2].abs() < ob.half[2] * 0.8
+            });
+            assert_eq!(inside.count(), 0, "{backend}: no water inside the paddle");
+
+            // a light ball floats at the water line; a heavy one sinks to the floor
+            for (density, floats) in [(400.0, true), (3000.0, false)] {
+                let mut s = sim();
+                call(&mut s, "fluid", json!({"kind": "water", "backend": backend, "size": [24, 24, 32], "cell": 0.025, "dt": 0.01}));
+                call(&mut s, "water", json!({"box": [0, 0, 0, 0.6, 0.6, 0.4]}));
+                call(&mut s, "object", json!({"name": "ball", "shape": "ball", "at": [0.3, 0.3, 0.55], "radius": 0.08, "float": true, "density": density}));
+                s.advance(150);
+                let z = s.collect_metrics()["ball.height_m"];
+                if floats {
+                    assert!(z > 0.36 && z < 0.5, "{backend}: density {density} floats at the surface (~0.4 m): {z}");
+                } else {
+                    assert!(z < 0.15, "{backend}: density {density} sinks to the floor: {z}");
+                }
+            }
+        }
+        let mut s = sim();
+        call(&mut s, "fluid", json!({"size": [8, 8, 8]}));
+        assert!(s.world_mut().call("object", &json!({"shape": "ball", "at": [0.4, 0.4, 0.4], "radius": 0.1})).unwrap_err().contains("liquid"));
     }
 
     #[test]
