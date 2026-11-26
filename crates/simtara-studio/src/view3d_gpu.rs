@@ -480,6 +480,8 @@ impl Gpu3d {
                 pass.set_pipeline(&self.terrain.ground);
                 pass.set_bind_group(1, g, &[]);
                 pass.draw(0..crate::view3d_terrain::Terrain3d::vertices(t), 0..1);
+                pass.set_pipeline(&self.terrain.skirt_ground);
+                pass.draw(0..crate::view3d_terrain::Terrain3d::side_vertices(t), 0..1);
             } else if pool {
                 pass.set_pipeline(&self.sky_pipe);
                 pass.draw(0..3, 0..1);
@@ -506,6 +508,8 @@ impl Gpu3d {
                 pass.set_pipeline(&self.terrain.water);
                 pass.set_bind_group(1, g, &[]);
                 pass.draw(0..crate::view3d_terrain::Terrain3d::vertices(t), 0..1);
+                pass.set_pipeline(&self.terrain.skirt_water);
+                pass.draw(0..crate::view3d_terrain::Terrain3d::side_vertices(t), 0..1);
             } else if let (Some(_), Some((_, vg, _))) = (volume, &self.vol) {
                 if pool {
                     // solids with depth, so the water can be in front of or behind them

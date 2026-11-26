@@ -16,6 +16,9 @@ pub struct Terrain3d {
     layout: wgpu::BindGroupLayout,
     pub ground: wgpu::RenderPipeline,
     pub water: wgpu::RenderPipeline,
+    /// the cut-away sides: earth below the ground, water between the ground and the surface
+    pub skirt_ground: wgpu::RenderPipeline,
+    pub skirt_water: wgpu::RenderPipeline,
     params: wgpu::Buffer,
     tex: Option<([wgpu::Texture; 2], [u32; 2], usize)>,
     group: Option<wgpu::BindGroup>,
@@ -55,8 +58,10 @@ impl Terrain3d {
         };
         let ground = pipe("simtara terrain ground", "vs_ground_t", "fs_ground_t", None, true);
         let water = pipe("simtara terrain water", "vs_water_t", "fs_water_t", Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), false);
+        let skirt_ground = pipe("simtara terrain sides", "vs_skirt_g", "fs_skirt_g", None, true);
+        let skirt_water = pipe("simtara terrain water sides", "vs_skirt_w", "fs_skirt_w", Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), false);
         let params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("simtara terrain params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        Terrain3d { layout, ground, water, params, tex: None, group: None }
+        Terrain3d { layout, ground, water, skirt_ground, skirt_water, params, tex: None, group: None }
     }
 
     /// Upload a new step (`fresh`), or only the drawing parameters.
@@ -115,6 +120,11 @@ impl Terrain3d {
 
     pub fn group(&self) -> Option<&wgpu::BindGroup> {
         self.group.as_ref()
+    }
+
+    /// Vertices for the four cut-away sides.
+    pub fn side_vertices(t: &crate::view3d::Terrain) -> u32 {
+        ((2 * t.nx.saturating_sub(1) + 2 * t.ny.saturating_sub(1)) * 6) as u32
     }
 
     /// Vertices for one draw of the grid.
@@ -276,5 +286,74 @@ fn surface(i: i32, j: i32, own: f32) -> f32 {
     // shallow water lets the ground show through; muddy water hides it sooner
     let a = clamp(max(1.0 - exp(-d / mix(2.5, 0.4, in.land)), f) + fres * 0.5, 0.25, 1.0);
     return vec4<f32>(min(col, vec3<f32>(1.0)) * a, a);
+}
+// ---- the cut-away sides of the block, like a map seen as a diorama ----
+struct SideT {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) @interpolate(flat) n: vec3<f32>,
+    @location(2) depth: f32,
+    @location(3) below: f32,
+};
+
+// which edge cell and its neighbour along the edge, and the outward normal
+fn side_cells(q: u32) -> array<vec3<i32>, 3> {
+    let nx = i32(T.n.x);
+    let ny = i32(T.n.y);
+    var k = i32(q);
+    if (k < nx - 1) { return array<vec3<i32>, 3>(vec3<i32>(k, 0, 0), vec3<i32>(k + 1, 0, 0), vec3<i32>(0, -1, 0)); }
+    k = k - (nx - 1);
+    if (k < nx - 1) { return array<vec3<i32>, 3>(vec3<i32>(k, ny - 1, 0), vec3<i32>(k + 1, ny - 1, 0), vec3<i32>(0, 1, 0)); }
+    k = k - (nx - 1);
+    if (k < ny - 1) { return array<vec3<i32>, 3>(vec3<i32>(0, k, 0), vec3<i32>(0, k + 1, 0), vec3<i32>(-1, 0, 0)); }
+    k = k - (ny - 1);
+    return array<vec3<i32>, 3>(vec3<i32>(nx - 1, k, 0), vec3<i32>(nx - 1, k + 1, 0), vec3<i32>(1, 0, 0));
+}
+
+fn side_vertex(vi: u32, water: bool) -> SideT {
+    let s = side_cells(vi / 6u);
+    let k = vi % 6u;
+    var along = array<u32, 6>(0u, 1u, 1u, 0u, 1u, 0u);
+    var up = array<u32, 6>(0u, 0u, 1u, 0u, 1u, 1u);
+    var ij = s[0].xy;
+    if (along[k] == 1u) { ij = s[1].xy; }
+    let c = cell_at(ij.x, ij.y);
+    // the block's base sits a little below the lowest ground
+    let base = -2.0 * T.n.z;
+    var lo = base;
+    var hi = c.x;
+    if (water) {
+        lo = c.x;
+        hi = select(c.x, c.x + c.y * T.n.w, c.y > T.s.y);
+    }
+    let z = select(lo, hi, up[k] == 1u);
+    var o: SideT;
+    // the sides run along the edge cells' centres, where the ground and water surfaces end
+    o.world = place(ij, z);
+    o.pos = project(o.world);
+    o.n = vec3<f32>(f32(s[2].x), f32(s[2].y), 0.0);
+    o.depth = (hi - z) / max(T.n.w, 1e-6);
+    o.below = (c.x - z) / max(T.n.w, 1e-6);
+    return o;
+}
+
+@vertex fn vs_skirt_g(@builtin(vertex_index) vi: u32) -> SideT { return side_vertex(vi, false); }
+@vertex fn vs_skirt_w(@builtin(vertex_index) vi: u32) -> SideT { return side_vertex(vi, true); }
+
+@fragment fn fs_skirt_g(in: SideT) -> @location(0) vec4<f32> {
+    // soil near the top, then layers of rock
+    let d = in.below;
+    let band = 0.5 + 0.5 * sin(in.world.z * 0.9);
+    var col = mix(vec3<f32>(0.42, 0.32, 0.22), vec3<f32>(0.50, 0.46, 0.42), smoothstep(1.0, 6.0, d));
+    col = col * (0.88 + 0.12 * band);
+    return vec4<f32>(shade(col, lit(in.n) * 0.85), 1.0);
+}
+
+@fragment fn fs_skirt_w(in: SideT) -> @location(0) vec4<f32> {
+    // the water seen from the side: lighter near the surface, darker with depth
+    let d = max(in.depth, 0.0);
+    let col = mix(vec3<f32>(0.12, 0.42, 0.52), vec3<f32>(0.01, 0.07, 0.16), 1.0 - exp(-d / 12.0)) * (U.mode.y + U.mode.z * 0.6);
+    let a = 0.88;
+    return vec4<f32>(col * a, a);
 }
 "#;
