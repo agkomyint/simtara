@@ -4,6 +4,7 @@
 mod build;
 mod view3d;
 mod view3d_gpu;
+mod view3d_terrain;
 mod view3d_water;
 mod picture;
 

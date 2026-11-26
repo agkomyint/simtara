@@ -3273,6 +3273,7 @@ dependencies = [
 name = "simtara-studio"
 version = "0.2.0"
 dependencies = [
+ "bytemuck",
  "eframe",
  "png 0.17.16",
  "pollster",

@@ -13,7 +13,7 @@ use simtara_things::Things;
 use crate::view3d;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXAMPLES: [(&str, &str, &str); 15] = [
+pub const EXAMPLES: [(&str, &str, &str); 17] = [
     ("Empty universe", "A blank page with a few hints. Describe what exists, then the rules.", EMPTY),
     ("An idea spreads", "1,500 people, 3 of them know an idea. Each tells friends. No physics at all.", IDEA),
     ("Forest fire (physics + chemistry)", "Fuel, heat and oxygen. Turn oxygen, rain and ignition temperature while it burns.", include_str!("../../../examples/fire.luau")),
@@ -22,6 +22,8 @@ pub const EXAMPLES: [(&str, &str, &str); 15] = [
     ("Smoke and wind around a building (3D)", "A real fluid in metres and seconds: wind flows around a building, a hot chimney's smoke rises and swirls in the wake.", include_str!("../../../examples/smoke.luau")),
     ("Fire plume (3D smoke and heat)", "A fire heats the air; the hot column rises, curls into a mushroom and breaks into swirls around a beam.", include_str!("../../../examples/plume.luau")),
     ("Play in a pool: steer three balls (3D)", "Keys 1-3 choose a ball, arrow keys / WASD move it through real water, E and Q up and down. A boat rides your waves.", include_str!("../../../examples/play.luau")),
+    ("Tsunami hits a coastal town (3D)", "An earthquake offshore lifts the sea floor; the tsunami crosses the bay, runs up the beach and through the streets. Shallow-water equations in metres and seconds.", include_str!("../../../examples/tsunami.luau")),
+    ("River valley flood and dam break (3D)", "Rain, a swollen river and a dam you can lower: watch the flood spread down the valley and into the town.", include_str!("../../../examples/flood.luau")),
     ("Water: a dam breaks (3D)", "75,000 water particles (FLIP): a wall of water crashes into a block, splashes up the far wall and settles.", include_str!("../../../examples/water.luau")),
     ("Pour a real liquid into a glass (3D)", "Real viscosity and density: honey, water, olive oil, milk, mercury... poured into a glass at real size. Change LIQUID at the top.", include_str!("../../../examples/pour.luau")),
     ("Airflow around a building (3D)", "A wind tunnel of 6,000 air cells. Smoke streaks show the air going around a building. Turn wind, viscosity and gusts.", include_str!("../../../examples/airflow.luau")),
@@ -528,9 +530,12 @@ impl BuildView {
             f.want_render = true;
             f.sun = sun;
         }
+        if let Some(f) = self.sim.world_mut().get_mut::<simtara_fields::shallow::Flood>() {
+            f.want_render = true;
+        }
         self.steer_objects(ui);        // Fluids compute their next step on another thread. While it is not ready, skip the tick
         // and keep drawing, so turning the camera stays smooth however slow the fluid is.
-        let fluid_busy = self.sim.world().get::<simtara_fields::Fluid>().is_some_and(|f| f.busy());
+        let fluid_busy = self.sim.world().get::<simtara_fields::Fluid>().is_some_and(|f| f.busy()) || self.sim.world().get::<simtara_fields::shallow::Flood>().is_some_and(|f| f.busy());
         if self.sim.run_state() == RunState::Running && fluid_busy {
             ui.ctx().request_repaint();
         } else {
@@ -703,8 +708,9 @@ impl BuildView {
             return;
         };
         let fluid = self.sim.world().get::<simtara_fields::Fluid>().filter(|f| f.ready());
-        if t.things.is_empty() && fluid.is_none() {
-            ui.weak("Nothing exists yet. Create things with spawn{...} or a fluid{...} in setup().");
+        let flood = self.sim.world().get::<simtara_fields::shallow::Flood>().filter(|f| f.ready());
+        if t.things.is_empty() && fluid.is_none() && flood.is_none() {
+            ui.weak("Nothing exists yet. Create things with spawn{...}, a fluid{...} or a flood{...} in setup().");
             return;
         }
         let mut param_edits: Vec<(String, f64)> = Vec::new();
@@ -871,7 +877,7 @@ impl BuildView {
         let base = if n > 50_000 { 1.2 } else if n > 5_000 { 2.0 } else if n > 800 { 3.0 } else { 5.0 };
 
         // smoke and water only make sense in 3D
-        let three = fluid.is_some() || self.mode3d.unwrap_or(match t.view.mode.as_deref() {
+        let three = fluid.is_some() || flood.is_some() || self.mode3d.unwrap_or(match t.view.mode.as_deref() {
             Some("3d") => true,
             Some(_) => false,
             None => chosen[4].is_some(),
@@ -975,6 +981,30 @@ impl BuildView {
             let on_gpu = self.gpu3d.is_some();
             let steerable = fluid.is_some_and(|f| f.objects.iter().any(|o| o.keys));
             let mut volume = None;
+            if let Some(f) = flood {
+                let made;
+                let r: &simtara_fields::shallow::FloodRender = match f.render.as_deref() {
+                    Some(r) => r,
+                    None => {
+                        let mut copy = f.clone();
+                        copy.want_render = true;
+                        copy.make_render();
+                        made = copy.render.unwrap_or_default();
+                        &made
+                    }
+                };
+                if self.step_seen.0 != r.generation {
+                    let gap = self.step_seen.1.elapsed().as_secs_f32();
+                    self.step_gap = if self.step_seen.0 == 0 { gap.min(0.2) } else { self.step_gap * 0.7 + gap.min(1.0) * 0.3 };
+                    self.step_seen = (r.generation, std::time::Instant::now());
+                }
+                let playing = self.sim.run_state() == RunState::Running;
+                let blend = if playing { (self.step_seen.1.elapsed().as_secs_f32() / self.step_gap.max(1e-3)).min(1.0) } else { 1.0 };
+                volume = Some(view3d::flood_volume(r, f.vertical.max(0.1) as f32, f.wet as f32, if self.gpu3d.is_some() { blend } else { 1.0 }));
+                if playing {
+                    ui.ctx().request_repaint();
+                }
+            }
             if let Some(f) = fluid {
                 let d = f.dims();
                 let water = f.kind == simtara_fields::Kind::Water;
@@ -999,6 +1029,7 @@ impl BuildView {
                     caustics: r.caustics.clone(),
                     liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()),
                     generation: r.generation,
+                    terrain: None,
                     objects: r.objects.clone(),
                     steered: f.objects.iter().enumerate().filter(|(_, o)| o.keys).map(|(i, _)| i).nth(self.steer),
                     blend: {
@@ -1214,8 +1245,9 @@ impl BuildView {
             }
         });
         let fluid = self.sim.world().get::<simtara_fields::Fluid>().filter(|f| f.ready());
-        if t.things.is_empty() && fluid.is_none() {
-            ui.weak("Nothing exists yet. Create things with spawn{...} or a fluid{...} in setup().");
+        let flood = self.sim.world().get::<simtara_fields::shallow::Flood>().filter(|f| f.ready());
+        if t.things.is_empty() && fluid.is_none() && flood.is_none() {
+            ui.weak("Nothing exists yet. Create things with spawn{...}, a fluid{...} or a flood{...} in setup().");
             return;
         }
         let rows: Vec<simtara_things::Thing> = t.of_kind(if self.kind_filter.is_empty() { None } else { Some(self.kind_filter.as_str()) }).take(200).cloned().collect();

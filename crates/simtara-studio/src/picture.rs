@@ -1,7 +1,8 @@
 //! Pictures of a universe without a window: run a script, draw chosen ticks on the GPU, save PNGs.
 //!
 //! `simtara-studio --picture FILE.luau --ticks 30,60,120 --out frame --size 960x600`
-//! writes `frame-30.png`, `frame-60.png`, ... (add `--obj` for the liquid's surface mesh too,`n//! `frame-30.obj`, ... for Blender and other tools). It uses the same camera, light and drawing as the
+//! writes `frame-30.png`, `frame-60.png`, ... (add `--obj` for the liquid's surface mesh too,
+//! `frame-30.obj`, ... for Blender and other tools). It uses the same camera, light and drawing as the
 //! 3D view, so it shows exactly what Studio shows.
 
 use crate::view3d::{self, Item, Mesh, Volume};
@@ -47,8 +48,16 @@ fn contents(sim: &simtara_core::Simulation) -> (Vec<Item>, Option<Volume>) {
         }
         let d = f.dims();
         let water = f.kind == simtara_fields::Kind::Water;
-        volume = Some(Volume { dims: [d.nx as u32, d.ny as u32, d.nz as u32], size: f.extent(), data: r.rgba.clone(), water_radius: if water { f.cell * 0.55 } else { 0.0 }, caustics: r.caustics.clone(), liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()), generation: r.generation, blend: 1.0, objects: r.objects.clone(), steered: None });
-    }    (items, volume)
+        volume = Some(Volume { dims: [d.nx as u32, d.ny as u32, d.nz as u32], size: f.extent(), data: r.rgba.clone(), water_radius: if water { f.cell * 0.55 } else { 0.0 }, caustics: r.caustics.clone(), liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()), generation: r.generation, blend: 1.0, objects: r.objects.clone(), steered: None, terrain: None });
+    }
+    if let Some(f) = sim.world().get::<simtara_fields::shallow::Flood>().filter(|f| f.ready()) {
+        let mut copy = f.clone();
+        copy.want_render = true;
+        copy.make_render();
+        let r = copy.render.unwrap_or_default();
+        volume = Some(view3d::flood_volume(&r, f.vertical.max(0.1) as f32, f.wet as f32, 1.0));
+    }
+    (items, volume)
 }
 
 pub fn run(script_path: &str, ticks: &[u64], out: &str, size: [u32; 2], obj: bool) -> Result<Vec<String>, String> {

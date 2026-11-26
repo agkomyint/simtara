@@ -190,6 +190,7 @@ pub struct Gpu3d {
     mist: wgpu::RenderPipeline,
     mist_inst: GrowBuf,
     water: crate::view3d_water::Water,
+    terrain: crate::view3d_terrain::Terrain3d,
     meshes: HashMap<String, GpuMesh>,
 }
 
@@ -298,6 +299,7 @@ impl Gpu3d {
         });
         let head = &SHADER[..SHADER.find("struct GroundOut").unwrap()];
         let water = crate::view3d_water::Water::new(&device, &layout, COLOR, DEPTH, SAMPLES, head);
+        let terrain = crate::view3d_terrain::Terrain3d::new(&device, &layout, COLOR, DEPTH, SAMPLES, head);
         let full = |label: &str, fs: &str, layout: &wgpu::PipelineLayout, depth_write: bool, compare: wgpu::CompareFunction| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -315,7 +317,7 @@ impl Gpu3d {
         let solids_pipe = full("simtara 3d solids", "fs_solids", &vol_pl, true, wgpu::CompareFunction::Less);
         let pool_pipe = full("simtara 3d pool", "fs_pool", &vol_pl, true, wgpu::CompareFunction::Less);
         let caustics = Self::caustics_group(&device, &queue, &vol_layout, &sampler, 1, 1, &[85]);
-        Gpu3d { device, queue, uniforms, bind, ground, balls, meshes_pipe, vol_pipe, vol_layout, sampler, vol: None, sky_pipe, solids_pipe, pool_pipe, caustics, uploaded: 0, target: None, ball_inst: GrowBuf::default(), mist, mist_inst: GrowBuf::default(), water, meshes: HashMap::new() }
+        Gpu3d { device, queue, uniforms, bind, ground, balls, meshes_pipe, vol_pipe, vol_layout, sampler, vol: None, sky_pipe, solids_pipe, pool_pipe, caustics, uploaded: 0, target: None, ball_inst: GrowBuf::default(), mist, mist_inst: GrowBuf::default(), water, terrain, meshes: HashMap::new() }
     }
 
     fn ensure_target(&mut self, size: [u32; 2]) -> bool {
@@ -366,7 +368,14 @@ impl Gpu3d {
         self.queue.write_buffer(&self.uniforms, 0, &u.bytes());
         // the fluid's pictures go to the card only when they changed (once per step, not per frame)
         let fresh = volume.is_some_and(|v| v.generation == 0 || v.generation != self.uploaded);
-        if let (Some(v), true) = (volume, fresh) {
+        let terr = volume.and_then(|v| v.terrain.as_ref());
+        if let Some(t) = terr {
+            // a flood: ground and water from height grids, no box of cells
+            self.terrain.prepare(&self.device, &self.queue, t, fresh);
+            if fresh {
+                self.uploaded = volume.unwrap().generation;
+            }
+        } else if let (Some(v), true) = (volume, fresh) {
             self.upload_volume(v);
             self.uploaded = v.generation;
         }
@@ -438,7 +447,13 @@ impl Gpu3d {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.bind, &[]);
-            if pool {
+            if let (Some(t), Some(g)) = (terr, self.terrain.group()) {
+                pass.set_pipeline(&self.sky_pipe);
+                pass.draw(0..3, 0..1);
+                pass.set_pipeline(&self.terrain.ground);
+                pass.set_bind_group(1, g, &[]);
+                pass.draw(0..crate::view3d_terrain::Terrain3d::vertices(t), 0..1);
+            } else if pool {
                 pass.set_pipeline(&self.sky_pipe);
                 pass.draw(0..3, 0..1);
                 pass.set_pipeline(&self.pool_pipe);
@@ -460,7 +475,11 @@ impl Gpu3d {
                 pass.set_vertex_buffer(1, g.inst.buf.as_ref().unwrap().slice(..));
                 pass.draw(0..g.count, 0..*n);
             }
-            if let (Some(_), Some((_, vg, _))) = (volume, &self.vol) {
+            if let (Some(t), Some(g)) = (terr, self.terrain.group()) {
+                pass.set_pipeline(&self.terrain.water);
+                pass.set_bind_group(1, g, &[]);
+                pass.draw(0..crate::view3d_terrain::Terrain3d::vertices(t), 0..1);
+            } else if let (Some(_), Some((_, vg, _))) = (volume, &self.vol) {
                 if pool {
                     // solids with depth, so the water can be in front of or behind them
                     pass.set_pipeline(&self.solids_pipe);
@@ -1184,7 +1203,7 @@ mod tests {
         for c in 0..(n * n * n) as usize {
             data[c * 4] = 26;
         }
-        let vol = Volume { dims: [n; 3], size: [2.0; 3], data, water_radius: 0.0, caustics: None, liquid: None, generation: 0, blend: 1.0, objects: Vec::new(), steered: None };
+        let vol = Volume { dims: [n; 3], size: [2.0; 3], data, water_radius: 0.0, caustics: None, liquid: None, generation: 0, blend: 1.0, objects: Vec::new(), steered: None, terrain: None };
         let mut u = camera(false);
         u.eye = [1.0, 10.0, 1.0];
         let size = [64, 64];
@@ -1233,7 +1252,7 @@ mod tests {
                 }
             }
         }
-        let vol = Volume { dims: [n; 3], size: [1.0; 3], data: vec![0; (n * n * n * 4) as usize], water_radius: 0.03, caustics: None, liquid: Some(field), generation: 0, blend: 1.0, objects: Vec::new(), steered: None };
+        let vol = Volume { dims: [n; 3], size: [1.0; 3], data: vec![0; (n * n * n * 4) as usize], water_radius: 0.03, caustics: None, liquid: Some(field), generation: 0, blend: 1.0, objects: Vec::new(), steered: None, terrain: None };
         let mut u = camera(false);
         u.eye = [0.5, 4.0, 0.5];
         u.ambient = 0.5;

@@ -22,5 +22,6 @@ pollster = "1"
 png = "0.17"
 serde_json.workspace = true
 eframe = "0.37"
+bytemuck = "1"
 
 

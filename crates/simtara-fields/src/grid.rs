@@ -182,6 +182,25 @@ pub fn advect_sharp_many(fields: &mut [&mut Vec<f32>], d: Dims, mac: &Mac, s: f3
     }
 }
 
+/// MacCormack advection of an array that sits at `off` (a face velocity or cell values): far
+/// less smearing than plain semi-Lagrangian, so a wake sheds vortices at the right Reynolds
+/// number and the air keeps its momentum. Clamped to the values it came from (no overshoot).
+pub fn advect_sharp_at(src: &[f32], dims: [usize; 3], off: [f32; 3], mac: &Mac, s: f32) -> Vec<f32> {
+    let n = src.len();
+    let pos = |e: usize| [(e % dims[0]) as f32 + off[0], ((e / dims[0]) % dims[1]) as f32 + off[1], (e / (dims[0] * dims[1])) as f32 + off[2]];
+    let back: Vec<[f32; 3]> = (0..n).into_par_iter().map(|e| at(mac.back(pos(e), s), off)).collect();
+    let a: Vec<f32> = back.par_iter().map(|p| sample(src, dims, *p)).collect();
+    (0..n)
+        .into_par_iter()
+        .map(|e| {
+            let b = sample(&a, dims, at(mac.back(pos(e), -s), off));
+            let v = a[e] + 0.5 * (src[e] - b);
+            let (lo, hi) = sample_range(src, dims, back[e]);
+            if v < lo || v > hi { a[e] } else { v }
+        })
+        .collect()
+}
+
 /// [`advect_sharp_many`] for one quantity.
 pub fn advect_sharp(src: &[f32], d: Dims, mac: &Mac, s: f32) -> Vec<f32> {
     let mut v = src.to_vec();
@@ -198,6 +217,12 @@ pub struct Sides {
     pub open_xmax: bool,
     /// Air blows in through the x = 0 side at this speed (m/s); None = a wall.
     pub inflow: Option<f32>,
+    /// The walls of the box hold the air next to them still (no-slip); false = it slides.
+    #[serde(default)]
+    pub no_slip: bool,
+    /// The top wall slides along x at this speed, m/s (the lid-driven cavity benchmark).
+    #[serde(default)]
+    pub lid: f32,
 }
 
 /// Walls, solids and the inflow: set the face velocities that are fixed.
@@ -293,6 +318,17 @@ pub fn project(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>, iter
 /// is, 1 = full of liquid): the ghost fluid method (Gibou et al. 2002). Without it the surface
 /// sits at the air cell's centre, half a cell too high, and pressures and waves come out wrong.
 pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>, iterations: usize, target: Option<&[f32]>, fill: Option<&[f32]>) -> f32 {
+    project_full(mac, flags, sides, p, iterations, target, fill, None)
+}
+
+/// Face weights for a fluid whose density changes from place to place (hot air, helium, CO2):
+/// `rho0 / rho` on every face (u, v, w arrays). A light gas is pushed further by the same
+/// pressure difference than a heavy one, as Newton says (a = -grad p / rho).
+pub type Beta = [Vec<f32>; 3];
+
+/// [`project_with`] with face weights `beta` (None = all 1, one density everywhere).
+#[allow(clippy::too_many_arguments)]
+pub fn project_full(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>, iterations: usize, target: Option<&[f32]>, fill: Option<&[f32]>, beta: Option<&Beta>) -> f32 {
     let d = mac.d;
     let cd = d.cd();
     let n = d.cells();
@@ -312,8 +348,14 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
             None => 1.0,
         }
     };
-    let mut fluid_nb = vec![0u8; n];
-    div.par_chunks_mut(cd[0] * cd[1]).zip(diag.par_chunks_mut(cd[0] * cd[1])).zip(fluid_nb.par_chunks_mut(cd[0] * cd[1])).enumerate().for_each(|(k, ((dv, dg), fl))| {
+    // weight of each of a cell's six faces (-x, +x, -y, +y, -z, +z) towards fluid neighbours
+    let mut coef = vec![[0.0f32; 6]; n];
+    let (bu, bv, bw) = match beta {
+        Some(b) => (Some(&b[0]), Some(&b[1]), Some(&b[2])),
+        None => (None, None, None),
+    };
+    let wt = |b: Option<&Vec<f32>>, f: usize| b.map_or(1.0, |a| a[f]);
+    div.par_chunks_mut(cd[0] * cd[1]).zip(diag.par_chunks_mut(cd[0] * cd[1])).zip(coef.par_chunks_mut(cd[0] * cd[1])).enumerate().for_each(|(k, ((dv, dg), cf))| {
         for j in 0..d.ny {
             for i in 0..d.nx {
                 let c = d.c(i, j, k);
@@ -323,27 +365,27 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
                 }
                 dv[s] = mac.u[idx(d.ud(), i + 1, j, k)] - mac.u[idx(d.ud(), i, j, k)] + mac.v[idx(d.vd(), i, j + 1, k)] - mac.v[idx(d.vd(), i, j, k)] + mac.w[idx(d.wd(), i, j, k + 1)] - mac.w[idx(d.wd(), i, j, k)] - target.map_or(0.0, |t| t[c]);
                 let mut count = 0.0f32;
-                let mut mask = 0u8;
-                let mut look = |inside: Option<usize>, open: bool, bit: u8| match inside {
+                let mut row = [0.0f32; 6];
+                let mut look = |inside: Option<usize>, open: bool, slot: usize, b: f32| match inside {
                     Some(nc) => match flags[nc] {
                         SOLID => {}
-                        AIR => count += 1.0 / theta(c, nc),
+                        AIR => count += b / theta(c, nc),
                         _ => {
-                            count += 1.0;
-                            mask |= bit;
+                            count += b;
+                            row[slot] = b;
                         }
                     },
-                    None if open => count += 1.0,
+                    None if open => count += b,
                     None => {}
                 };
-                look((i > 0).then(|| d.c(i - 1, j, k)), false, 1);
-                look((i + 1 < d.nx).then(|| d.c(i + 1, j, k)), sides.open_xmax, 2);
-                look((j > 0).then(|| d.c(i, j - 1, k)), false, 4);
-                look((j + 1 < d.ny).then(|| d.c(i, j + 1, k)), false, 8);
-                look((k > 0).then(|| d.c(i, j, k - 1)), false, 16);
-                look((k + 1 < d.nz).then(|| d.c(i, j, k + 1)), sides.open_top, 32);
+                look((i > 0).then(|| d.c(i - 1, j, k)), false, 0, wt(bu, idx(d.ud(), i, j, k)));
+                look((i + 1 < d.nx).then(|| d.c(i + 1, j, k)), sides.open_xmax, 1, wt(bu, idx(d.ud(), i + 1, j, k)));
+                look((j > 0).then(|| d.c(i, j - 1, k)), false, 2, wt(bv, idx(d.vd(), i, j, k)));
+                look((j + 1 < d.ny).then(|| d.c(i, j + 1, k)), false, 3, wt(bv, idx(d.vd(), i, j + 1, k)));
+                look((k > 0).then(|| d.c(i, j, k - 1)), false, 4, wt(bw, idx(d.wd(), i, j, k)));
+                look((k + 1 < d.nz).then(|| d.c(i, j, k + 1)), sides.open_top, 5, wt(bw, idx(d.wd(), i, j, k + 1)));
                 dg[s] = count;
-                fl[s] = mask;
+                cf[s] = row;
             }
         }
     });
@@ -352,56 +394,48 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
     // It converges far faster than relaxation sweeps, which matters for water: a half-solved
     // pressure lets water compress and gives the wrong hydrostatic pressure and wave speeds.
     // Sums are taken in fixed chunks in a fixed order, so the result repeats exactly.
-    let active: Vec<u32> = (0..n as u32).filter(|&c| flags[c as usize] == FLUID && diag[c as usize] > 0.0).collect();
+    // every vector covers all cells; cells outside the solve keep zeros (inv_diag = 0), so each
+    // update is one parallel pass over plain arrays
+    let inv_diag: Vec<f32> = (0..n).into_par_iter().map(|c| if flags[c] == FLUID && diag[c] > 0.0 { 1.0 / diag[c] } else { 0.0 }).collect();
     let (sx, sy, sz) = (1usize, cd[0], cd[0] * cd[1]);
     let apply = |x: &[f32], out: &mut [f32]| {
-        let vals: Vec<f32> = active
-            .par_iter()
-            .map(|&c| {
-                let c = c as usize;
-                let m = fluid_nb[c];
-                let mut s = diag[c] * x[c];
-                if m & 1 != 0 { s -= x[c - sx]; }
-                if m & 2 != 0 { s -= x[c + sx]; }
-                if m & 4 != 0 { s -= x[c - sy]; }
-                if m & 8 != 0 { s -= x[c + sy]; }
-                if m & 16 != 0 { s -= x[c - sz]; }
-                if m & 32 != 0 { s -= x[c + sz]; }
-                s
-            })
-            .collect();
-        for (&c, v) in active.iter().zip(vals) {
-            out[c as usize] = v;
-        }
+        out.par_iter_mut().enumerate().for_each(|(c, o)| {
+            if inv_diag[c] == 0.0 {
+                *o = 0.0;
+                return;
+            }
+            let m = &coef[c];
+            let mut s = diag[c] * x[c];
+            if m[0] != 0.0 { s -= m[0] * x[c - sx]; }
+            if m[1] != 0.0 { s -= m[1] * x[c + sx]; }
+            if m[2] != 0.0 { s -= m[2] * x[c - sy]; }
+            if m[3] != 0.0 { s -= m[3] * x[c + sy]; }
+            if m[4] != 0.0 { s -= m[4] * x[c - sz]; }
+            if m[5] != 0.0 { s -= m[5] * x[c + sz]; }
+            *o = s;
+        });
     };
+    // sums in fixed chunks, added in a fixed order: the result repeats exactly
     let dot = |a: &[f32], b: &[f32]| -> f64 {
-        let parts: Vec<f64> = active.par_chunks(4096).map(|ch| ch.iter().map(|&c| a[c as usize] as f64 * b[c as usize] as f64).sum::<f64>()).collect();
+        let parts: Vec<f64> = a.par_chunks(8192).zip(b.par_chunks(8192)).map(|(x, y)| x.iter().zip(y).map(|(u, v)| *u as f64 * *v as f64).sum::<f64>()).collect();
         parts.iter().sum()
     };
-    for c in 0..n {
-        if !(flags[c] == FLUID && diag[c] > 0.0) {
-            p[c] = 0.0;
-        }
-    }
+    let absmax = |a: &[f32]| a.par_iter().fold(|| 0.0f32, |m, x| m.max(x.abs())).reduce(|| 0.0, f32::max);
+    p.par_iter_mut().zip(inv_diag.par_iter()).for_each(|(x, d)| if *d == 0.0 { *x = 0.0 });
     let mut ap = vec![0.0f32; n];
     apply(p, &mut ap);
     // residual r = b - A p, with b = -div
-    let mut r = vec![0.0f32; n];
-    for &c in &active {
-        let c = c as usize;
-        r[c] = -div[c] - ap[c];
-    }
-    let bnorm = active.iter().map(|&c| div[c as usize].abs()).fold(0.0f32, f32::max).max(1e-12);
-    let mut z = vec![0.0f32; n];
-    for &c in &active {
-        z[c as usize] = r[c as usize] / diag[c as usize];
-    }
+    let mut r: Vec<f32> = (0..n).into_par_iter().map(|c| if inv_diag[c] == 0.0 { 0.0 } else { -div[c] - ap[c] }).collect();
+    let bnorm = (0..n).into_par_iter().map(|c| if inv_diag[c] == 0.0 { 0.0 } else { div[c].abs() }).reduce(|| 0.0, f32::max).max(1e-12);
+    let mut z: Vec<f32> = r.par_iter().zip(inv_diag.par_iter()).map(|(r, d)| r * d).collect();
     let mut dir = z.clone();
     let mut rz = dot(&r, &z);
     let max_iter = (iterations * 4).max(20);
+    // liquids need the pressure almost exact (hydrostatics, wave speeds); for a gas, a thousandth
+    // of the divergence left is far below what the grid can resolve, and many times cheaper
+    let tol = if beta.is_some() { 1e-3 } else { 1e-5 };
     for _ in 0..max_iter {
-        let rmax = active.iter().map(|&c| r[c as usize].abs()).fold(0.0f32, f32::max);
-        if rmax <= 1e-5 * bnorm || rz.abs() < 1e-30 {
+        if absmax(&r) <= tol * bnorm || rz.abs() < 1e-30 {
             break;
         }
         apply(&dir, &mut ap);
@@ -410,19 +444,15 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
             break;
         }
         let alpha = (rz / dap) as f32;
-        for &c in &active {
-            let c = c as usize;
-            p[c] += alpha * dir[c];
-            r[c] -= alpha * ap[c];
-            z[c] = r[c] / diag[c];
-        }
+        p.par_iter_mut().zip(r.par_iter_mut()).zip(z.par_iter_mut()).zip(dir.par_iter().zip(ap.par_iter()).zip(inv_diag.par_iter())).for_each(|(((p, r), z), ((d, a), i))| {
+            *p += alpha * d;
+            *r -= alpha * a;
+            *z = *r * i;
+        });
         let rz_new = dot(&r, &z);
-        let beta = (rz_new / rz) as f32;
+        let bk = (rz_new / rz) as f32;
         rz = rz_new;
-        for &c in &active {
-            let c = c as usize;
-            dir[c] = z[c] + beta * dir[c];
-        }
+        dir.par_iter_mut().zip(z.par_iter()).for_each(|(d, z)| *d = z + bk * *d);
     }    for c in 0..n {
         if flags[c] != FLUID {
             p[c] = 0.0;
@@ -450,6 +480,7 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
     mac.u.par_chunks_mut(ud[0] * ud[1]).enumerate().for_each(|(k, slab)| {
         for j in 0..d.ny {
             for i in 1..=d.nx {
+                let b = wt(bu, idx(ud, i, j, k));
                 let (l, r) = if i == d.nx {
                     if !sides.open_xmax {
                         continue;
@@ -460,12 +491,12 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
                         continue;
                     }
                     if let Some(g) = jump(d.c(i - 1, j, k), d.c(i, j, k)) {
-                        slab[i + ud[0] * j] -= g;
+                        slab[i + ud[0] * j] -= b * g;
                     }
                     continue;
                 };
                 if let (Some(l), Some(r)) = (l, r) {
-                    slab[i + ud[0] * j] -= r - l;
+                    slab[i + ud[0] * j] -= b * (r - l);
                 }
             }
         }
@@ -477,7 +508,7 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
                     continue;
                 }
                 if let Some(g) = jump(d.c(i, j - 1, k), d.c(i, j, k)) {
-                    slab[i + vd[0] * j] -= g;
+                    slab[i + vd[0] * j] -= wt(bv, idx(vd, i, j, k)) * g;
                 }
             }
         }
@@ -488,6 +519,7 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
         }
         for j in 0..d.ny {
             for i in 0..d.nx {
+                let b = wt(bw, idx(wd, i, j, k));
                 let (l, r) = if k == d.nz {
                     if !sides.open_top {
                         continue;
@@ -498,12 +530,12 @@ pub fn project_with(mac: &mut Mac, flags: &[u8], sides: Sides, p: &mut Vec<f32>,
                         continue;
                     }
                     if let Some(g) = jump(d.c(i, j, k - 1), d.c(i, j, k)) {
-                        slab[i + wd[0] * j] -= g;
+                        slab[i + wd[0] * j] -= b * g;
                     }
                     continue;
                 };
                 if let (Some(l), Some(r)) = (l, r) {
-                    slab[i + wd[0] * j] -= r - l;
+                    slab[i + wd[0] * j] -= b * (r - l);
                 }
             }
         }
@@ -617,7 +649,7 @@ mod tests {
         let mut mac = Mac::new(d);
         // air blowing in from the side, nowhere to go but up
         let flags = vec![FLUID; d.cells()];
-        let sides = Sides { open_top: true, open_xmax: false, inflow: Some(1.0) };
+        let sides = Sides { open_top: true, open_xmax: false, inflow: Some(1.0), ..Default::default() };
         enforce(&mut mac, &flags, sides);
         let mut p = Vec::new();
         let left = project(&mut mac, &flags, sides, &mut p, 400, None);
@@ -635,7 +667,7 @@ mod tests {
             *u = 1.0 + (i % 7) as f32 * 0.1;
         }
         let flags = vec![FLUID; d.cells()];
-        let sides = Sides { open_top: false, open_xmax: true, inflow: Some(1.0) };
+        let sides = Sides { open_top: false, open_xmax: true, inflow: Some(1.0), ..Default::default() };
         let mut p = Vec::new();
         let t = std::time::Instant::now();
         for _ in 0..5 {

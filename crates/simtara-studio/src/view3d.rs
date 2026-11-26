@@ -130,6 +130,128 @@ pub struct Volume {
     pub objects: Vec<(String, [f32; 3], [f32; 3])>,
     /// The object the keys steer (drawn with a glow).
     pub steered: Option<usize>,
+    /// Ground and flood water (from `simtara_fields::shallow::Flood`) instead of a box of cells.
+    pub terrain: Option<Terrain>,
+}
+
+/// A flood to draw: ground heights already in picture units (lowest ground at 0, times
+/// `vertical`), water depth and speed in metres and m/s.
+pub struct Terrain {
+    pub nx: usize,
+    pub ny: usize,
+    pub cell: f32,
+    /// how much heights are stretched to be seen (1 = true)
+    pub vertical: f32,
+    pub bed: Vec<f32>,
+    pub depth: Vec<f32>,
+    pub speed: Vec<f32>,
+    pub building: Vec<u8>,
+    /// the sea level, picture units
+    pub sea_z: f32,
+    /// depth that counts as wet, metres
+    pub wet: f32,
+}
+
+/// The 3D view's picture of a flood.
+pub fn flood_volume(r: &simtara_fields::shallow::FloodRender, vertical: f32, wet: f32, blend: f32) -> Volume {
+    let low = r.bed.iter().cloned().fold(f32::MAX, f32::min);
+    let top = r.bed.iter().zip(&r.depth).map(|(b, d)| b + d).fold(f32::MIN, f32::max);
+    let size = [r.nx as f32 * r.cell, r.ny as f32 * r.cell, ((top - low) * vertical).max(r.cell) * 1.02];
+    Volume {
+        dims: [r.nx as u32, r.ny as u32, 1],
+        size,
+        data: Vec::new(),
+        water_radius: 0.0,
+        caustics: None,
+        liquid: None,
+        generation: r.generation,
+        blend,
+        objects: Vec::new(),
+        steered: None,
+        terrain: Some(Terrain {
+            nx: r.nx,
+            ny: r.ny,
+            cell: r.cell,
+            vertical,
+            bed: r.bed.iter().map(|b| (b - low) * vertical).collect(),
+            depth: r.depth.clone(),
+            speed: r.speed.clone(),
+            building: r.building.clone(),
+            sea_z: (r.sea_level - low) * vertical,
+            // thinner sheets (a wet street, a film of rain) are not drawn as water
+            wet: wet.max(0.03),
+        }),
+    }
+}
+
+/// Colour of the ground at a height (metres above the sea), as the GPU shader does it.
+fn ground_colour(e: f32, building: bool, steep: bool) -> [f32; 3] {
+    let mix = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    if building {
+        return [0.80, 0.76, 0.72];
+    }
+    let sand = [0.84, 0.77, 0.58];
+    let mut c = mix([0.52, 0.50, 0.40], sand, ((e + 6.0) / 5.5).clamp(0.0, 1.0));
+    c = mix(c, [0.32, 0.50, 0.24], ((e - 1.0) / 2.0).clamp(0.0, 1.0));
+    if steep && e > 0.0 {
+        c = [0.47, 0.44, 0.40];
+    }
+    c
+}
+
+/// The CPU painter's flood: a coarse grid of shaded quads, far ones first.
+fn cpu_terrain(painter: &egui::Painter, view: &View, t: &Terrain, l: [f32; 3], light: &Light) {
+    let step = (t.nx.max(t.ny) / 110).max(1);
+    let (w, h) = ((t.nx - 1) / step, (t.ny - 1) / step);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let at = |i: usize, j: usize| (j * step).min(t.ny - 1) * t.nx + (i * step).min(t.nx - 1);
+    let pos = |i: usize, j: usize, z: f32| [((i * step) as f32 + 0.5) * t.cell, ((j * step) as f32 + 0.5) * t.cell, z];
+    let mut quads: Vec<(f32, usize, usize)> = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            if let Some((_, d)) = view.project(pos(i, j, t.bed[at(i, j)])) {
+                quads.push((d, i, j));
+            }
+        }
+    }
+    quads.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut mesh = egui::Mesh::default();
+    let lit = |n: [f32; 3]| (light.ambient as f32 + light.strength as f32 * dot(n, l).max(0.0)).min(1.4);
+    for (_, i, j) in quads {
+        let c = [at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)];
+        let g = [pos(i, j, t.bed[c[0]]), pos(i + 1, j, t.bed[c[1]]), pos(i + 1, j + 1, t.bed[c[2]]), pos(i, j + 1, t.bed[c[3]])];
+        let n = norm(cross(sub(g[1], g[0]), sub(g[3], g[0])));
+        let e = (t.bed[c[0]] - t.sea_z) / t.vertical.max(1e-6);
+        let col = ground_colour(e, t.building[c[0]] > 0, n[2] < 0.75);
+        let k = lit(n);
+        let colour = Color32::from_rgb((col[0] * k * 255.0).min(255.0) as u8, (col[1] * k * 255.0).min(255.0) as u8, (col[2] * k * 255.0).min(255.0) as u8);
+        let mut quad = |pts: [[f32; 3]; 4], colour: Color32| {
+            let p: Vec<Pos2> = pts.iter().filter_map(|p| view.project(*p).map(|x| x.0)).collect();
+            if p.len() == 4 {
+                let b = mesh.vertices.len() as u32;
+                for q in p {
+                    mesh.vertices.push(vertex(q, colour));
+                }
+                mesh.indices.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+            }
+        };
+        quad(g, colour);
+        let d = c.map(|x| t.depth[x]);
+        if d.iter().any(|x| *x > t.wet) {
+            let s = |k: usize| if d[k] > t.wet { t.bed[c[k]] + d[k] * t.vertical } else { t.bed[c[k]] - 0.05 * t.cell };
+            let wpts = [pos(i, j, s(0)), pos(i + 1, j, s(1)), pos(i + 1, j + 1, s(2)), pos(i, j + 1, s(3))];
+            let deep = d.iter().cloned().fold(0.0f32, f32::max);
+            let land = e > 0.5;
+            let a = (1.0 - (-deep / if land { 0.5 } else { 2.5 }).exp()).clamp(0.35, 0.95);
+            let base: [f32; 3] = if land { [0.50, 0.40, 0.26] } else { [0.08, 0.32, 0.45] };
+            let k = light.ambient as f32 + light.strength as f32 * 0.7;
+            let to = |x: f32| (x * k * a * 255.0).min(255.0) as u8;
+            quad(wpts, Color32::from_rgba_premultiplied(to(base[0]), to(base[1]), to(base[2]), (a * 255.0) as u8));
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 impl Volume {
@@ -382,7 +504,9 @@ pub fn draw(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response, items: &[Ite
         }
     }
     painter.add(egui::Shape::mesh(mesh));
-    if let Some(vol) = volume {
+    if let Some(t) = volume.and_then(|v| v.terrain.as_ref()) {
+        cpu_terrain(&painter, &view, t, l, light);
+    } else if let Some(vol) = volume {
         let img = cpu_volume(&view, rect, vol, light, ortho, focal);
         let id = egui::Id::unique("simtara cpu volume");
         let tex = match ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(id)) {

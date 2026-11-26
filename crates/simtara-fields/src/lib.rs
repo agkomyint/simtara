@@ -12,12 +12,17 @@
 //! number in it may name a `param{...}` slider instead, so a control changes the fluid live.
 //! Runs repeat exactly for a seed, on one core or many.
 
+pub mod gas;
+#[cfg(test)]
+mod gas_tests;
 pub mod gpu;
+pub mod gpu_smoke;
 pub mod grid;
 pub mod liquid;
 pub mod mesh;
+pub mod shallow;
 
-use grid::{advect, enforce, extrapolate, idx, project, Dims, Mac, Sides, AIR, FLUID, OFF_U, OFF_V, OFF_W, SOLID};
+use grid::{enforce, extrapolate, idx, Dims, Mac, Sides, AIR, FLUID, OFF_U, OFF_V, OFF_W, SOLID};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -37,6 +42,12 @@ pub enum Num {
     P(String),
     /// Another number times a factor (e.g. a slider in millilitres used as cubic metres).
     Scaled(Box<Num>, f64),
+}
+
+impl Default for Num {
+    fn default() -> Num {
+        Num::N(0.0)
+    }
 }
 
 impl Num {
@@ -86,6 +97,21 @@ pub struct Settings {
     /// Name of the liquid, when a known one was chosen.
     #[serde(default)]
     pub liquid: String,
+    /// Smagorinsky constant of the turbulence model (swirls smaller than a cell mix the air);
+    /// 0 = off. 0.17 is the textbook value (FDS uses 0.2).
+    #[serde(default = "smagorinsky")]
+    pub turbulence: Num,
+    /// 1 = heated air expands (real gas, low-Mach); 0 = it keeps its volume (Boussinesq).
+    #[serde(default = "one")]
+    pub expansion: Num,
+}
+
+fn smagorinsky() -> Num {
+    Num::N(0.17)
+}
+
+fn one() -> Num {
+    Num::N(1.0)
 }
 
 fn yes() -> bool {
@@ -128,12 +154,14 @@ impl Default for Settings {
             viscosity: Num::N(0.0),
             density: 998.0,
             liquid: String::new(),
+            turbulence: smagorinsky(),
+            expansion: one(),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Resolved {
+pub(crate) struct Resolved {
     wind: Option<f32>,
     buoyancy: f32,
     weight: f32,
@@ -143,6 +171,8 @@ struct Resolved {
     gravity: f32,
     iterations: usize,
     viscosity: f32,
+    turbulence: f32,
+    expansion: f32,
 }
 
 impl Settings {
@@ -157,6 +187,8 @@ impl Settings {
             gravity: self.gravity.get(p),
             iterations: self.iterations.get(p).clamp(1.0, 500.0) as usize,
             viscosity: self.viscosity.get(p).max(0.0),
+            turbulence: self.turbulence.get(p).max(0.0),
+            expansion: self.expansion.get(p).clamp(0.0, 1.0),
         }
     }
 }
@@ -176,6 +208,15 @@ pub struct Emitter {
     pub water: Num,
     #[serde(default)]
     carry: f32,
+    /// Which of the fluid's gases comes out (index into `Fluid::gases`).
+    #[serde(default)]
+    pub gas: Option<usize>,
+    /// Volume fraction of that gas in what comes out (1 = pure gas).
+    #[serde(default = "one")]
+    pub amount: Num,
+    /// Gas pushed out, m³/s (it takes room: the air around is pushed away). `flow_l` = litres/s.
+    #[serde(default = "zero")]
+    pub flow: Num,
 }
 
 /// A solid object that moves through a liquid: a ball or a box. It pushes the water (its cells
@@ -261,6 +302,21 @@ pub struct Fluid {
     pub smoke: Vec<f32>,
     /// Kelvin above the air.
     pub temp: Vec<f32>,
+    /// Gases mixed into the air (indices into `gas::GASES`), and the volume (mole) fraction of
+    /// each per cell.
+    #[serde(default)]
+    pub gases: Vec<usize>,
+    #[serde(default)]
+    pub fractions: Vec<Vec<f32>>,
+    /// The box's walls hold the air still (no-slip) instead of letting it slide.
+    #[serde(default)]
+    pub no_slip: bool,
+    /// The top wall slides along x at this speed, m/s (lid-driven cavity benchmark).
+    #[serde(default)]
+    pub lid: f32,
+    /// Largest eddy viscosity of the last step, m²/s (sizes the GPU's diffusion steps).
+    #[serde(default)]
+    pub eddy_max: f32,
     /// Water particles: position (grid units) and velocity (m/s).
     pub particles: Vec<[f32; 6]>,
     /// APIC: how velocity changes around each particle (du/dx..dw/dz, m/s per cell).
@@ -319,6 +375,8 @@ pub struct RenderData {
     pub caustics: Option<(u32, u32, Vec<u8>)>,
     /// Objects: shape, centre and half sizes (metres), to draw exactly.
     pub objects: Vec<(String, [f32; 3], [f32; 3])>,
+    /// Colour the mixed-in gases are tinted with (alpha channel of `rgba` = how much gas).
+    pub gas_tint: [f32; 3],
 }
 
 static RENDER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -406,7 +464,7 @@ impl Fluid {
     }
 
     fn sides(&self, r: &Resolved) -> Sides {
-        Sides { open_top: self.open_top, open_xmax: self.open_side, inflow: r.wind }
+        Sides { open_top: self.open_top, open_xmax: self.open_side, inflow: r.wind, no_slip: self.no_slip, lid: self.lid }
     }
 
     pub fn create(&mut self, kind: Kind, d: Dims, cell: f32, dt: f32, seed: u64) {
@@ -425,6 +483,11 @@ impl Fluid {
             pressure: vec![0.0; n],
             smoke: vec![0.0; n],
             temp: vec![0.0; n],
+            gases: Vec::new(),
+            fractions: Vec::new(),
+            no_slip: false,
+            lid: 0.0,
+            eddy_max: 0.0,
             particles: Vec::new(),
             affine: Vec::new(),
             emitters: Vec::new(),
@@ -443,6 +506,46 @@ impl Fluid {
             sun: old.sun,
             render: None,
         };
+        if kind == Kind::Smoke {
+            self.settings.viscosity = Num::N(gas::NU_AIR as f64);
+        }
+    }
+
+    /// The index of `gas` (a `gas::GASES` index) in this fluid's mix, added if new.
+    pub fn gas_slot(&mut self, gas: usize) -> usize {
+        if let Some(i) = self.gases.iter().position(|g| *g == gas) {
+            return i;
+        }
+        self.gases.push(gas);
+        self.fractions.push(vec![0.0; self.dims().cells()]);
+        self.gpu_generation = 0;
+        self.gases.len() - 1
+    }
+
+    /// Fill the cells whose centres are inside `inside` (metres) with gas `slot` at volume
+    /// fraction `y` (and optionally a temperature, kelvin above the air).
+    pub fn add_gas(&mut self, slot: usize, y: f32, temp: Option<f32>, inside: impl Fn([f32; 3]) -> bool) -> usize {
+        let d = self.dims();
+        let h = self.cell;
+        let mut n = 0;
+        for c in 0..d.cells() {
+            let (i, j, k) = (c % d.nx, (c / d.nx) % d.ny, c / (d.nx * d.ny));
+            if self.solid[c] != SOLID && inside([(i as f32 + 0.5) * h, (j as f32 + 0.5) * h, (k as f32 + 0.5) * h]) {
+                // the other gases make room
+                for (g, f) in self.fractions.iter_mut().enumerate() {
+                    if g != slot {
+                        f[c] *= 1.0 - y;
+                    }
+                }
+                self.fractions[slot][c] = y;
+                if let Some(t) = temp {
+                    self.temp[c] = t;
+                }
+                n += 1;
+            }
+        }
+        self.gpu_generation = 0;
+        n
     }
 
     /// Mark the cells whose centres are inside `inside(x, y, z)` (metres) as solid.
@@ -458,6 +561,9 @@ impl Fluid {
                         self.solid[c] = SOLID;
                         self.smoke[c] = 0.0;
                         self.temp[c] = 0.0;
+                        for y in self.fractions.iter_mut() {
+                            y[c] = 0.0;
+                        }
                         n += 1;
                     }
                 }
@@ -528,78 +634,187 @@ impl Fluid {
         out
     }
 
+    /// The emitters as cells with this tick's values (the same for the CPU and the GPU).
+    fn smoke_sources(&self, params: &BTreeMap<String, Param>) -> Vec<Source> {
+        let h = self.cell;
+        self.emitters
+            .iter()
+            .map(|e| {
+                let cells: Vec<u32> = self.emitter_cells(e).into_iter().map(|c| c as u32).collect();
+                let vel = [e.velocity[0].get(params), e.velocity[1].get(params), e.velocity[2].get(params)];
+                let flow = e.flow.get(params).max(0.0);
+                Source {
+                    smoke: e.smoke.get(params),
+                    heat: e.heat.get(params),
+                    vel: (vel != [0.0; 3]).then_some(vel),
+                    gas: e.gas.filter(|g| *g < self.gases.len()),
+                    amount: e.amount.get(params).clamp(0.0, 1.0),
+                    // the gas comes out of the emitter's cells: each one grows by its share, per second
+                    flow: if cells.is_empty() { 0.0 } else { flow / (cells.len() as f32 * h * h * h) },
+                    cells,
+                }
+            })
+            .collect()
+    }
+
     fn step_smoke(&mut self, r: &Resolved, params: &BTreeMap<String, Param>) {
-        let d = self.dims();
         let h = self.cell;
         let speed = self.mac.as_ref().unwrap().max_speed().max(r.wind.unwrap_or(0.0).abs());
         // semi-Lagrangian steps stay stable at any speed; split only when air crosses many cells
         let subs = ((speed * self.dt / h / 5.0).ceil() as usize).clamp(1, 4);
         let sdt = self.dt / subs as f32;
-        for _ in 0..subs {
-            // sources
-            for e in self.emitters.clone() {
-                let (smoke, heat) = (e.smoke.get(params), e.heat.get(params));
-                let vel = [e.velocity[0].get(params), e.velocity[1].get(params), e.velocity[2].get(params)];
-                let cells = self.emitter_cells(&e);
-                let mac = self.mac.as_mut().unwrap();
-                for &c in &cells {
-                    self.smoke[c] += smoke * sdt;
-                    self.temp[c] = self.temp[c].max(heat);
-                    if vel != [0.0; 3] {
-                        let (i, j, k) = (c % d.nx, (c / d.nx) % d.ny, c / (d.nx * d.ny));
-                        mac.u[idx(d.ud(), i, j, k)] = vel[0];
-                        mac.u[idx(d.ud(), i + 1, j, k)] = vel[0];
-                        mac.v[idx(d.vd(), i, j, k)] = vel[1];
-                        mac.v[idx(d.vd(), i, j + 1, k)] = vel[1];
-                        mac.w[idx(d.wd(), i, j, k)] = vel[2];
-                        mac.w[idx(d.wd(), i, j, k + 1)] = vel[2];
-                    }
-                }
-            }
-            // carry everything along
-            let k_cells = sdt / h;
-            let old = self.mac.take().unwrap();
-            let mut mac = Mac { d, u: advect(&old.u, d.ud(), OFF_U, &old, k_cells), v: advect(&old.v, d.vd(), OFF_V, &old, k_cells), w: advect(&old.w, d.wd(), OFF_W, &old, k_cells) };
-            grid::advect_sharp_many(&mut [&mut self.smoke, &mut self.temp], d, &old, k_cells);
-            // hot air rises, dense smoke sinks
-            let lift = r.buoyancy * r.gravity / AMBIENT_K;
-            let (temp, smoke) = (&self.temp, &self.smoke);
-            let wd = d.wd();
-            mac.w.par_chunks_mut(wd[0] * wd[1]).enumerate().for_each(|(k, slab)| {
-                if k == 0 || k == d.nz {
+        let sources = self.smoke_sources(params);
+        if self.smoke_on_gpu() {
+            match gpu_smoke::step(self, r, &sources, subs, sdt) {
+                Ok(()) => {
+                    self.last_dt = sdt;
                     return;
                 }
-                for j in 0..d.ny {
-                    for i in 0..d.nx {
-                        let (a, b) = (d.c(i, j, k - 1), d.c(i, j, k));
-                        let t = 0.5 * (temp[a] + temp[b]);
-                        let s = 0.5 * (smoke[a] + smoke[b]);
-                        slab[i + wd[0] * j] += sdt * (lift * t - r.weight * s);
-                    }
-                }
-            });
-            if r.vorticity > 0.0 {
-                confine(&mut mac, &self.solid, r.vorticity, h, sdt);
+                Err(_) => self.use_gpu = false,
             }
-            // cooling, thinning, nothing inside solids
-            let (cool, fade) = ((-r.cooling * sdt).exp(), (-r.fade * sdt).exp());
-            let solid = &self.solid;
-            self.temp.par_iter_mut().zip(self.smoke.par_iter_mut()).zip(solid.par_iter()).for_each(|((t, s), f)| {
-                if *f == SOLID {
-                    *t = 0.0;
-                    *s = 0.0;
-                } else {
-                    *t *= cool;
-                    *s = (*s * fade).max(0.0);
-                }
-            });
-            let sides = self.sides(r);
-            enforce(&mut mac, &self.solid, sides);
-            self.divergence = project(&mut mac, &self.solid, sides, &mut self.pressure, r.iterations, None);
-            self.mac = Some(mac);
         }
+        for _ in 0..subs {
+            self.smoke_substep(r, &sources, sdt);
+        }
+        // the CPU changed the gas: the graphics card's copy is out of date
+        self.gpu_generation = 0;
+        self.last_dt = sdt;
     }
 
+    /// True when this fluid's gas is solved on the graphics card.
+    pub fn smoke_on_gpu(&self) -> bool {
+        self.kind == Kind::Smoke && self.use_gpu && gpu_smoke::available()
+    }
+
+    /// One step of the gas (low-Mach, variable density; see `gas`).
+    fn smoke_substep(&mut self, r: &Resolved, sources: &[Source], sdt: f32) {
+        let d = self.dims();
+        let h = self.cell;
+        let n = d.cells();
+        let s_cells = sdt / h;
+        let t0 = AMBIENT_K;
+        let rho0 = gas::rho_air(t0);
+        let tm = std::time::Instant::now();
+        let lap = |what: &str| if std::env::var_os("SIMTARA_TIMING").is_some() { eprintln!("  {what}: {:.1} ms", tm.elapsed().as_secs_f64() * 1000.0) };
+        // 1. everything is carried along by the air
+        let old = self.mac.take().unwrap();
+        let mut mac = Mac { d, u: grid::advect_sharp_at(&old.u, d.ud(), OFF_U, &old, s_cells), v: grid::advect_sharp_at(&old.v, d.vd(), OFF_V, &old, s_cells), w: grid::advect_sharp_at(&old.w, d.wd(), OFF_W, &old, s_cells) };
+        // (how much of each gas there is, less what leaves through open sides: semi-Lagrangian
+        // advection does not keep amounts exactly, so they are put back to what they must be)
+        let keep: Vec<f64> = self.fractions.iter().map(|x| amount_after_outflow(x, &old, self.open_top, self.open_side, s_cells)).collect();
+        {
+            let mut fields: Vec<&mut Vec<f32>> = vec![&mut self.smoke, &mut self.temp];
+            fields.extend(self.fractions.iter_mut());
+            grid::advect_sharp_many(&mut fields, d, &old, s_cells);
+        }
+        for (x, want) in self.fractions.iter_mut().zip(keep) {
+            let have: f64 = x.par_iter().map(|v| *v as f64).sum();
+            if have > 1e-12 && want > 0.0 {
+                let k = (want / have) as f32;
+                x.par_iter_mut().for_each(|v| *v = (*v * k).min(1.0));
+            }
+        }
+        lap("advect");
+        // 2. gas let out: with a flow, exactly that volume of gas comes in (and pushes the air
+        //    away); without one, the emitter holds its cells at that concentration
+        let mut flow = vec![0.0f32; n];
+        for src in sources {
+            if let Some(g) = src.gas {
+                for &c in &src.cells {
+                    if src.flow > 0.0 {
+                        add_gas_volume(&mut self.fractions, g, src.amount, src.flow * sdt, c as usize);
+                    } else {
+                        hold_gas(&mut self.fractions, g, src.amount, c as usize);
+                    }
+                }
+            }
+            for &c in &src.cells {
+                flow[c as usize] += src.flow;
+            }
+        }
+        let kinds = self.gases.clone();
+        let temp_before = self.temp.clone();
+        // 3. heat and smoke sources
+        for src in sources {
+            for &c in &src.cells {
+                let c = c as usize;
+                self.smoke[c] += src.smoke * sdt;
+                self.temp[c] = self.temp[c].max(src.heat);
+            }
+        }
+        // 4. mixing: molecules plus the swirls smaller than a cell
+        let nu_t = gas::eddy_viscosity(&mac, &self.solid, r.turbulence, h);
+        gas::diffuse_scalar(&mut self.temp, &self.solid, d, gas::ALPHA_AIR, &nu_t, 1.0 / gas::PR_T, sdt, h);
+        gas::diffuse_scalar(&mut self.smoke, &self.solid, d, 0.0, &nu_t, 1.0 / gas::SC_T, sdt, h);
+        for (g, y) in self.fractions.iter_mut().enumerate() {
+            gas::diffuse_scalar(y, &self.solid, d, gas::GASES[kinds[g]].diffusion, &nu_t, 1.0 / gas::SC_T, sdt, h);
+        }
+        lap("diffuse");
+        // 5. cooling, thinning, nothing inside solids
+        let (cool, fade) = ((-r.cooling * sdt).exp(), (-r.fade * sdt).exp());
+        let solid = &self.solid;
+        self.temp.par_iter_mut().zip(self.smoke.par_iter_mut()).zip(solid.par_iter()).for_each(|((t, s), f)| {
+            if *f == SOLID {
+                *t = 0.0;
+                *s = 0.0;
+            } else {
+                *t *= cool;
+                *s = (*s * fade).max(0.0);
+            }
+        });
+        for y in self.fractions.iter_mut() {
+            y.par_iter_mut().zip(solid.par_iter()).for_each(|(v, f)| *v = if *f == SOLID { 0.0 } else { v.clamp(0.0, 1.0) });
+        }
+        // 6. the density that results; heated air takes more room (ideal gases mixing by
+        //    volume do not, so only the heating counts)
+        let rho = gas::density(&self.temp, &self.fractions, &kinds, t0);
+        let (rho_f, beta) = gas::faces(&rho, d, rho0);
+        // 7. buoyancy: g (rho0 - rho) / rho, exactly (hot air and helium up, CO2 down); dense smoke sinks
+        let smoke = &self.smoke;
+        let wd = d.wd();
+        mac.w.par_chunks_mut(wd[0] * wd[1]).enumerate().for_each(|(k, slab)| {
+            if k == 0 || k == d.nz {
+                return;
+            }
+            for j in 0..d.ny {
+                for i in 0..d.nx {
+                    let f = i + wd[0] * j;
+                    let rf = rho_f[2][idx(wd, i, j, k)];
+                    let s = 0.5 * (smoke[d.c(i, j, k - 1)] + smoke[d.c(i, j, k)]);
+                    slab[f] += sdt * (r.buoyancy * r.gravity * (rho0 - rf) / rf - r.weight * s);
+                }
+            }
+        });
+        if r.vorticity > 0.0 {
+            confine(&mut mac, &self.solid, r.vorticity, h, sdt);
+        }
+        // 8. viscosity (air's own plus the turbulence model's)
+        let sides = self.sides(r);
+        gas::diffuse_velocity(&mut mac, &self.solid, sides, r.viscosity, &nu_t, sdt, h);
+        for src in sources {
+            if let Some(vel) = src.vel {
+                set_cell_velocity(&mut mac, &src.cells, vel);
+            }
+        }
+        enforce(&mut mac, &self.solid, sides);
+        lap("forces+viscosity");
+        // 9. pressure: the flow takes exactly the room the gas needs
+        let mut target: Vec<f32> = (0..n).into_par_iter().map(|c| if self.solid[c] == SOLID { 0.0 } else { (r.expansion * ((t0 + self.temp[c]).max(50.0) / (t0 + temp_before[c]).max(50.0)).ln() / sdt + flow[c]) * h }).collect();
+        if !self.open_top && !self.open_side {
+            // a closed box: the pressure rises everywhere instead (no room to grow into)
+            let (sum, cnt) = target.iter().zip(&self.solid).filter(|(_, s)| **s != SOLID).fold((0.0f64, 0usize), |(a, n), (t, _)| (a + *t as f64, n + 1));
+            let mean = (sum / cnt.max(1) as f64) as f32;
+            for (t, s) in target.iter_mut().zip(&self.solid) {
+                if *s != SOLID {
+                    *t -= mean;
+                }
+            }
+        }
+        grid::project_full(&mut mac, &self.solid, sides, &mut self.pressure, r.iterations, Some(&target), None, Some(&beta));
+        self.divergence = residual(&mac, &self.solid, &target);
+        lap("pressure");
+        self.mac = Some(mac);
+    }
     /// True when this fluid's liquid is solved on the graphics card.
     pub fn on_gpu(&self) -> bool {
         self.kind == Kind::Water && self.use_gpu && gpu::available()
@@ -776,7 +991,7 @@ impl Fluid {
         }
         // the CPU is about to change the particles: the card's copy is out of date
         self.gpu_generation = 0;
-        let sides = Sides { open_top: false, open_xmax: false, inflow: None };
+        let sides = Sides { open_top: false, open_xmax: false, inflow: None, ..Default::default() };
         self.push_out_of_objects();
         for _ in 0..subs {
             self.emit_water(sdt, params);
@@ -916,7 +1131,11 @@ impl Fluid {
             }
             "water" => per_cell.get(c).copied().unwrap_or(0.0),
             "pressure" => self.pressure_pa(c),
-            _ => 0.0,
+            "density" => gas::cell_density(self.temp[c], &self.fractions, &self.gases, c, AMBIENT_K),
+            other => match self.gas_named(other) {
+                Some(g) => gas::volume_fraction(&self.fractions, &self.gases, g, c),
+                None => 0.0,
+            },
         }
     }
 
@@ -969,8 +1188,11 @@ impl Fluid {
                 }
             }
         }
-        // sums are physical amounts: smoke in m³ of full density, water in m³
+        // sums are physical amounts: smoke in m³ of full density, water in m³, a gas in kg
         let vol = (h as f64).powi(3);
+        if let (Some(g), "sum") = (self.gas_named(&m.field), m.op.as_str()) {
+            return self.gas_kg(g, m.region);
+        }
         match (m.op.as_str(), m.field.as_str()) {
             ("count", _) => n as f64,
             ("max", _) if max > f64::MIN => max,
@@ -982,6 +1204,34 @@ impl Fluid {
             }
             _ => 0.0,
         }
+    }
+
+    /// The slot of the gas called `name` in this fluid, if it has it.
+    pub fn gas_named(&self, name: &str) -> Option<usize> {
+        let k = gas::find(name)?;
+        self.gases.iter().position(|g| *g == k)
+    }
+
+    /// Kilograms of gas slot `g` in the whole box or a region of it (metres).
+    pub fn gas_kg(&self, g: usize, region: Option<[f32; 6]>) -> f64 {
+        let d = self.dims();
+        let h = self.cell;
+        let vol = (h as f64).powi(3);
+        (0..d.cells())
+            .into_par_iter()
+            .map(|c| {
+                let (i, j, k) = (c % d.nx, (c / d.nx) % d.ny, c / (d.nx * d.ny));
+                if let Some(b) = region {
+                    let p = [(i as f32 + 0.5) * h, (j as f32 + 0.5) * h, (k as f32 + 0.5) * h];
+                    if (0..3).any(|a| p[a] < b[a].min(b[a + 3]) || p[a] > b[a].max(b[a + 3])) {
+                        return 0.0;
+                    }
+                }
+                // the gas's own share of the mass: its volume fraction times its own density here
+                let rho_g = gas::P0 * gas::GASES[self.gases[g]].molar_mass / (gas::R * (AMBIENT_K + self.temp[c]).max(50.0));
+                self.fractions[g][c].clamp(0.0, 1.0) as f64 * rho_g as f64 * vol
+            })
+            .sum()
     }
 
     /// Pressure in a cell above the air's, pascals (from the last pressure solve).
@@ -1003,8 +1253,8 @@ impl Fluid {
                 out.push(("fluid.fastest_m_s".into(), mac.max_speed() as f64));
                 out.push(("smoke.amount_m3".into(), self.smoke.iter().map(|x| *x as f64).sum::<f64>() * h.powi(3)));
                 out.push(("smoke.hottest_c".into(), 20.0 + self.temp.iter().cloned().fold(0.0f32, f32::max) as f64));
-                // where the smoke is: its centre, metres
                 let d = self.dims();
+                // where the smoke is: its centre, metres
                 let total: f64 = self.smoke.iter().map(|x| *x as f64).sum();
                 if total > 1e-9 {
                     let (mut cx, mut cz) = (0.0, 0.0);
@@ -1014,6 +1264,20 @@ impl Fluid {
                     }
                     out.push(("smoke.centre_x_m".into(), cx / total));
                     out.push(("smoke.centre_height_m".into(), cz / total));
+                }
+                // each gas: how much there is, where it is, the most found anywhere (volume %)
+                for (g, &k) in self.gases.iter().enumerate() {
+                    let name = gas::GASES[k].name;
+                    let kg = self.gas_kg(g, None);
+                    out.push((format!("{name}.kg"), kg));
+                    let y = &self.fractions[g];
+                    let total: f64 = y.iter().map(|x| *x as f64).sum();
+                    if total > 1e-12 {
+                        let cz: f64 = y.iter().enumerate().map(|(c, v)| *v as f64 * ((c / (d.nx * d.ny)) as f64 + 0.5) * h).sum();
+                        out.push((format!("{name}.centre_height_m"), cz / total));
+                    }
+                    let most = (0..d.cells()).into_par_iter().map(|c| gas::volume_fraction(&self.fractions, &self.gases, g, c)).reduce(|| 0.0, f32::max);
+                    out.push((format!("{name}.highest_percent"), most as f64 * 100.0));
                 }
             }
             Kind::Water => {
@@ -1041,15 +1305,35 @@ impl Fluid {
     }
 
     /// Picture data for the 3D view, one RGBA byte quad per cell (x fastest, then y, then z):
-    /// r = smoke, g = heat (0..600 K above the air), b = solid, a = unused.
+    /// r = smoke, g = heat (0..600 K above the air), b = solid, a = mixed-in gas (volume fraction
+    /// of all of them; drawn with `gas_tint`).
     pub fn volume_rgba(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.solid.len() * 4];
+        let gases = self.gases.len().min(self.fractions.len());
         out.par_chunks_mut(4).enumerate().for_each(|(c, px)| {
             px[0] = (self.smoke.get(c).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0) as u8;
             px[1] = ((self.temp.get(c).copied().unwrap_or(0.0) / 600.0).clamp(0.0, 1.0) * 255.0) as u8;
             px[2] = if self.solid[c] == SOLID { 255 } else { 0 };
+            if gases > 0 && self.kind == Kind::Smoke {
+                let x: f32 = (0..gases).map(|g| gas::volume_fraction(&self.fractions, &self.gases, g, c)).sum();
+                px[3] = (x.clamp(0.0, 1.0).sqrt() * 255.0) as u8;
+            }
         });
         out
+    }
+
+    /// The colour mixed-in gases are drawn with: each gas's colour, weighted by how much there is.
+    pub fn gas_tint(&self) -> [f32; 3] {
+        let mut c = [0.0f64; 3];
+        let mut w = 0.0f64;
+        for (g, &k) in self.gases.iter().enumerate() {
+            let amount: f64 = self.fractions.get(g).map_or(0.0, |x| x.iter().map(|v| *v as f64).sum());
+            for a in 0..3 {
+                c[a] += amount * gas::GASES[k].colour[a] as f64;
+            }
+            w += amount;
+        }
+        if w <= 0.0 { [0.6, 0.8, 0.6] } else { [(c[0] / w) as f32, (c[1] / w) as f32, (c[2] / w) as f32] }
     }
 
     /// Caustics on the floor: sunlight refracted by the water surface and focused into bright
@@ -1192,6 +1476,7 @@ impl Fluid {
             spray,
             caustics: water.then(|| self.caustics(self.sun, 3)),
             objects: self.objects.iter().map(|o| (o.shape.clone(), o.pos, o.half)).collect(),
+            gas_tint: self.gas_tint(),
         }));
     }
 
@@ -1223,6 +1508,120 @@ impl Fluid {
             })
             .collect()
     }
+}
+
+/// An emitter for one tick: its cells and what it does to them.
+#[derive(Clone, Debug, Default)]
+pub struct Source {
+    pub cells: Vec<u32>,
+    /// smoke added per second; temperature held (kelvin above the air)
+    pub smoke: f32,
+    pub heat: f32,
+    pub vel: Option<[f32; 3]>,
+    /// gas slot held at mass fraction `amount`
+    pub gas: Option<usize>,
+    pub amount: f32,
+    /// how fast each cell grows from the gas pushed out, 1/s
+    pub flow: f32,
+}
+
+/// Let `q` (a fraction of the cell's volume) of gas into cell `c`, `amount` of it gas `g`: the
+/// cell's contents are diluted by what comes in (mixing by volume).
+pub(crate) fn add_gas_volume(x: &mut [Vec<f32>], g: usize, amount: f32, q: f32, c: usize) {
+    let f = q / (1.0 + q);
+    for (i, v) in x.iter_mut().enumerate() {
+        v[c] = v[c] * (1.0 - f) + if i == g { amount * f } else { 0.0 };
+    }
+}
+
+/// The total of `x` (cell units) once the flow has carried some out through the open top and
+/// the open far side over one step (`s` = dt / cell size). Air blown in carries none. Where the
+/// flow spreads out (a leak pushing gas out, heated air) the gas in it takes more room: the
+/// total grows by x times the divergence.
+fn amount_after_outflow(x: &[f32], mac: &Mac, open_top: bool, open_side: bool, s: f32) -> f64 {
+    let d = mac.d;
+    let total: f64 = (0..d.cells())
+        .into_par_iter()
+        .map(|c| {
+            let v = x[c];
+            if v == 0.0 {
+                return 0.0;
+            }
+            let (i, j, k) = (c % d.nx, (c / d.nx) % d.ny, c / (d.nx * d.ny));
+            let dv = mac.u[idx(d.ud(), i + 1, j, k)] - mac.u[idx(d.ud(), i, j, k)] + mac.v[idx(d.vd(), i, j + 1, k)] - mac.v[idx(d.vd(), i, j, k)] + mac.w[idx(d.wd(), i, j, k + 1)] - mac.w[idx(d.wd(), i, j, k)];
+            v as f64 * (1.0 + (dv * s) as f64)
+        })
+        .sum();
+    let mut out = 0.0f64;
+    if open_top {
+        for j in 0..d.ny {
+            for i in 0..d.nx {
+                let w = mac.w[idx(d.wd(), i, j, d.nz)];
+                if w > 0.0 {
+                    out += (x[d.c(i, j, d.nz - 1)] * (w * s).min(1.0)) as f64;
+                }
+            }
+        }
+    }
+    if open_side {
+        for k in 0..d.nz {
+            for j in 0..d.ny {
+                let u = mac.u[idx(d.ud(), d.nx, j, k)];
+                if u > 0.0 {
+                    out += (x[d.c(d.nx - 1, j, k)] * (u * s).min(1.0)) as f64;
+                }
+            }
+        }
+    }
+    (total - out).max(0.0)
+}
+
+/// Hold gas `g` at volume fraction at least `amount` in cell `c`; the other gases make room.
+pub(crate) fn hold_gas(y: &mut [Vec<f32>], g: usize, amount: f32, c: usize) {
+    if y[g][c] >= amount {
+        return;
+    }
+    y[g][c] = amount;
+    let others: f32 = y.iter().enumerate().filter(|(i, _)| *i != g).map(|(_, f)| f[c]).sum();
+    if others + amount > 1.0 && others > 0.0 {
+        let k = (1.0 - amount) / others;
+        for (i, f) in y.iter_mut().enumerate() {
+            if i != g {
+                f[c] *= k;
+            }
+        }
+    }
+}
+
+/// Faces of these cells blow at `vel` (an emitter's jet).
+pub(crate) fn set_cell_velocity(mac: &mut Mac, cells: &[u32], vel: [f32; 3]) {
+    let d = mac.d;
+    for &c in cells {
+        let c = c as usize;
+        let (i, j, k) = (c % d.nx, (c / d.nx) % d.ny, c / (d.nx * d.ny));
+        mac.u[idx(d.ud(), i, j, k)] = vel[0];
+        mac.u[idx(d.ud(), i + 1, j, k)] = vel[0];
+        mac.v[idx(d.vd(), i, j, k)] = vel[1];
+        mac.v[idx(d.vd(), i, j + 1, k)] = vel[1];
+        mac.w[idx(d.wd(), i, j, k)] = vel[2];
+        mac.w[idx(d.wd(), i, j, k + 1)] = vel[2];
+    }
+}
+
+/// Largest |divergence - target| of any fluid cell, m/s: how far the solve is from exact.
+pub(crate) fn residual(mac: &Mac, flags: &[u8], target: &[f32]) -> f32 {
+    let d = mac.d;
+    (0..d.cells())
+        .into_par_iter()
+        .map(|c| {
+            if flags[c] != FLUID {
+                return 0.0;
+            }
+            let (i, j, k) = (c % d.nx, (c / d.nx) % d.ny, c / (d.nx * d.ny));
+            let dv = mac.u[idx(d.ud(), i + 1, j, k)] - mac.u[idx(d.ud(), i, j, k)] + mac.v[idx(d.vd(), i, j + 1, k)] - mac.v[idx(d.vd(), i, j, k)] + mac.w[idx(d.wd(), i, j, k + 1)] - mac.w[idx(d.wd(), i, j, k)];
+            (dv - target[c]).abs()
+        })
+        .reduce(|| 0.0, f32::max)
 }
 
 pub(crate) fn is_solid(solid: &[u8], d: Dims, p: [f32; 3]) -> bool {
@@ -1362,6 +1761,7 @@ impl Module for FluidModule {
     fn build(&self, b: &mut Builder) {
         b.world.insert_persistent("fluid", Fluid { rng: b.config.seed, ..Fluid::default() });
         register_commands(b.world);
+        shallow::install(b);
         b.add_system(Stage::Update, FluidSystem);
         b.add_metric_source(|w| {
             let Some(f) = w.get::<Fluid>() else { return Vec::new() };
@@ -1406,11 +1806,11 @@ fn register_commands(w: &mut World) {
         f.changed = true;
         if let Some(size) = floats(a, "size", 3)? {
             let kind = match a.get("kind").and_then(Value::as_str).unwrap_or("smoke") {
-                "smoke" | "air" => Kind::Smoke,
-                "water" => Kind::Water,
-                other => return Err(format!("kind '{other}': use \"smoke\" or \"water\"")),
+                "smoke" | "air" | "gas" => Kind::Smoke,
+                "water" | "liquid" => Kind::Water,
+                other => return Err(format!("kind '{other}': use \"gas\" (also \"smoke\", \"air\") or \"water\"")),
             };
-            let n = |x: f32| (x.round() as usize).clamp(4, 512);
+            let n = |x: f32| (x.round() as usize).clamp(1, 512);
             let d = Dims { nx: n(size[0]), ny: n(size[1]), nz: n(size[2]) };
             if d.cells() > 8_000_000 {
                 return Err(format!("{} cells is too many (at most 8 million)", d.cells()));
@@ -1431,7 +1831,7 @@ fn register_commands(w: &mut World) {
             f.open_side = true;
             f.open_top = false;
         }
-        for (key, slot) in [("buoyancy", &mut s.buoyancy), ("weight", &mut s.weight), ("vorticity", &mut s.vorticity), ("cooling", &mut s.cooling), ("fade", &mut s.fade), ("gravity", &mut s.gravity), ("flip", &mut s.flip), ("iterations", &mut s.iterations)] {
+        for (key, slot) in [("buoyancy", &mut s.buoyancy), ("weight", &mut s.weight), ("vorticity", &mut s.vorticity), ("cooling", &mut s.cooling), ("fade", &mut s.fade), ("gravity", &mut s.gravity), ("flip", &mut s.flip), ("iterations", &mut s.iterations), ("turbulence", &mut s.turbulence), ("expansion", &mut s.expansion)] {
             if let Some(v) = num(a, key)? {
                 *slot = v;
             }
@@ -1460,6 +1860,15 @@ fn register_commands(w: &mut World) {
         }
         if let Some(b) = a.get("open_side").and_then(Value::as_bool) {
             f.open_side = b;
+        }
+        match a.get("walls").and_then(Value::as_str) {
+            None => {}
+            Some("slip") => f.no_slip = false,
+            Some("stick") | Some("no-slip") | Some("no_slip") => f.no_slip = true,
+            Some(other) => return Err(format!("walls '{other}': use \"slip\" (air slides along them) or \"stick\" (no-slip)")),
+        }
+        if let Some(v) = a.get("lid").and_then(Value::as_f64) {
+            f.lid = v as f32;
         }
         let d = f.dims();
         Ok(json!({"cells": d.cells(), "size_m": f.extent(), "kind": f.kind}))
@@ -1514,9 +1923,44 @@ fn register_commands(w: &mut World) {
                 (None, None) => Num::N(0.0),
             },
             carry: 0.0,
+            gas: None,
+            amount: num(a, "amount")?.unwrap_or(Num::N(1.0)),
+            flow: match (num(a, "flow")?, num(a, "flow_l")?) {
+                (Some(v), _) => v,
+                (None, Some(l)) => Num::Scaled(Box::new(l), 1e-3),
+                (None, None) => Num::N(0.0),
+            },
         };
+        let mut e = e;
+        if let Some(name) = a.get("gas").and_then(Value::as_str) {
+            if f.kind != Kind::Smoke {
+                return Err("gases mix into air: use fluid{kind = \"gas\", ...}".into());
+            }
+            let k = gas::find(name).ok_or_else(|| format!("gas '{name}': known gases are {}", gas::names()))?;
+            e.gas = Some(f.gas_slot(k));
+        }
         f.emitters.push(e);
         Ok(json!(f.emitters.len()))
+    });
+    // gas{name = "co2", box = {...} | ball = {x, y, z, r}, fraction = 1, temp = 0}: fill a region with a gas
+    w.register_command("gas", |w, a| {
+        let f = fluid_mut(w)?;
+        if f.kind != Kind::Smoke {
+            return Err("gases mix into air: use fluid{kind = \"gas\", ...}".into());
+        }
+        let name = a.get("name").and_then(Value::as_str).ok_or_else(|| format!("gas needs a name: one of {}", gas::names()))?;
+        let k = gas::find(name).ok_or_else(|| format!("gas '{name}': known gases are {}", gas::names()))?;
+        let y = a.get("fraction").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+        let temp = a.get("temp").and_then(Value::as_f64).map(|t| t as f32);
+        let slot = f.gas_slot(k);
+        let n = if let Some(b) = floats(a, "box", 6)? {
+            f.add_gas(slot, y, temp, move |p| (0..3).all(|k| p[k] >= b[k].min(b[k + 3]) && p[k] <= b[k].max(b[k + 3])))
+        } else if let Some(b) = floats(a, "ball", 4)? {
+            f.add_gas(slot, y, temp, move |p| (p[0] - b[0]).powi(2) + (p[1] - b[1]).powi(2) + (p[2] - b[2]).powi(2) <= b[3] * b[3])
+        } else {
+            0
+        };
+        Ok(json!({"cells": n, "gas": gas::GASES[k].name, "molar_mass_kg_mol": gas::GASES[k].molar_mass}))
     });
     // water{box = {x0, y0, z0, x1, y1, z1}}: fill with still water
     w.register_command("water", |w, a| {
@@ -1589,8 +2033,12 @@ fn register_commands(w: &mut World) {
         f.changed = true;
         let name = a.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("fluid_metric needs a name")?.to_string();
         let field = a.get("field").and_then(Value::as_str).unwrap_or("smoke").to_string();
-        if !["smoke", "temp", "speed", "water", "pressure"].contains(&field.as_str()) {
-            return Err(format!("field '{field}': use smoke, temp, speed, water or pressure"));
+        let field = match gas::find(&field) {
+            Some(k) => gas::GASES[k].name.to_string(),
+            None => field,
+        };
+        if !["smoke", "temp", "speed", "water", "pressure", "density"].contains(&field.as_str()) && gas::find(&field).is_none() {
+            return Err(format!("field '{field}': use smoke, temp, speed, water, pressure, density or a gas ({})", gas::names()));
         }
         let op = a.get("op").and_then(Value::as_str).unwrap_or("sum").to_string();
         if !["sum", "mean", "max", "count"].contains(&op.as_str()) {
@@ -1603,7 +2051,7 @@ fn register_commands(w: &mut World) {
     });
     w.register_command("fluid_info", |w, _| {
         let f = w.get::<Fluid>().filter(|f| f.ready()).ok_or("make the fluid first: fluid{size = {64, 32, 32}, cell = 0.1}")?;
-        Ok(json!({"kind": f.kind, "backend": if f.on_gpu() { "gpu" } else { "cpu" }, "liquid": f.settings.liquid, "density": f.settings.density, "cells": f.dims().cells(), "cell_m": f.cell, "dt_s": f.dt, "size_m": f.extent(), "seconds": f.seconds, "particles": f.particles.len(), "divergence": f.divergence, "emitters": f.emitters.len()}))
+        Ok(json!({"kind": f.kind, "backend": if f.on_gpu() || f.smoke_on_gpu() { "gpu" } else { "cpu" }, "gases": f.gases.iter().map(|k| gas::GASES[*k].name).collect::<Vec<_>>(), "liquid": f.settings.liquid, "density": f.settings.density, "cells": f.dims().cells(), "cell_m": f.cell, "dt_s": f.dt, "size_m": f.extent(), "seconds": f.seconds, "particles": f.particles.len(), "divergence": f.divergence, "emitters": f.emitters.len()}))
     });
 }
 
@@ -1748,7 +2196,7 @@ mod tests {
         let make = || {
             let mut f = Fluid::default();
             f.create(Kind::Smoke, Dims { nx: 16, ny: 10, nz: 12 }, 0.1, 1.0 / 30.0, 5);
-            f.emitters.push(Emitter { at: [0.8, 0.5, 0.3], radius: 0.2, smoke: Num::N(3.0), heat: Num::P("heat".into()), velocity: [Num::N(0.0), Num::N(0.0), Num::N(0.5)], water: Num::N(0.0), carry: 0.0 });
+            f.emitters.push(Emitter { at: [0.8, 0.5, 0.3], radius: 0.2, smoke: Num::N(3.0), heat: Num::P("heat".into()), velocity: [Num::N(0.0), Num::N(0.0), Num::N(0.5)], water: Num::N(0.0), carry: 0.0, gas: None, amount: Num::N(1.0), flow: Num::N(0.0) });
             f
         };
         let mut params = BTreeMap::new();
@@ -1774,7 +2222,7 @@ mod tests {
 
         // a change while a step runs (a new emitter) is not lost: that step is redone
         // (it applies from the step after the one you are looking at, in both ways of running)
-        let extra = Emitter { at: [0.4, 0.5, 0.6], radius: 0.15, smoke: Num::N(5.0), heat: Num::N(0.0), velocity: [Num::N(0.0), Num::N(0.0), Num::N(0.0)], water: Num::N(0.0), carry: 0.0 };
+        let extra = Emitter { at: [0.4, 0.5, 0.6], radius: 0.15, smoke: Num::N(5.0), heat: Num::N(0.0), velocity: [Num::N(0.0), Num::N(0.0), Num::N(0.0)], water: Num::N(0.0), carry: 0.0, gas: None, amount: Num::N(1.0), flow: Num::N(0.0) };
         let mut c = make();
         for t in 0..6 {
             c.tick(&params, false);
