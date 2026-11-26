@@ -12,6 +12,8 @@ function setup()
   param{name = "rain", value = 0, min = 0, max = 100, about = "rain, millimetres per hour", owner = "nature"}
   param{name = "river", value = 40, min = 0, max = 400, about = "river flow coming into the valley, m³/s", owner = "nature"}
   param{name = "roughness", value = 0.035, min = 0.01, max = 0.12, about = "Manning roughness of the ground", owner = "nature"}
+  param{name = "wind", value = 6, min = 0, max = 40, about = "wind speed, m/s", owner = "nature"}
+  param{name = "wind_dir", value = 180, min = 0, max = 360, about = "direction the wind blows towards, degrees (0 = east, down the valley; 180 = west, up it)", owner = "nature"}
 
   flood{size = {300, 150}, cell = 10, dt = 2, manning = "roughness", vertical = 3, sea_level = -100,
         edges = {west = "wall", north = "wall", south = "wall", east = "open"}}
@@ -33,6 +35,9 @@ function setup()
   end
   river{at = {30, 750}, radius = 20, flow = "river", velocity = {1, 0}}
   rain{rate = "rain"}
+  wind{speed = "wind", direction = "wind_dir"}
+  flag{at = {1980, 1120}, height = 40}
+  flag{at = {800, 300}, height = 40}
 
   flood_metric{name = "town flooded (m²)", field = "wet", op = "sum", box = {2000, 860, 2500, 1100}}
   flood_metric{name = "deepest water in town (m)", field = "depth", op = "max", box = {2000, 860, 2500, 1100}}

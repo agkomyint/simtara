@@ -1000,7 +1000,7 @@ impl BuildView {
                 }
                 let playing = self.sim.run_state() == RunState::Running;
                 let blend = if playing { (self.step_seen.1.elapsed().as_secs_f32() / self.step_gap.max(1e-3)).min(1.0) } else { 1.0 };
-                volume = Some(view3d::flood_volume(r, f.vertical.max(0.1) as f32, f.wet as f32, if self.gpu3d.is_some() { blend } else { 1.0 }));
+                volume = Some(view3d::flood_volume(r, f.vertical.max(0.1) as f32, f.wet as f32, if self.gpu3d.is_some() { blend } else { 1.0 }, &f.flags, f.wind_now));
                 if playing {
                     ui.ctx().request_repaint();
                 }
@@ -1030,6 +1030,7 @@ impl BuildView {
                     liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()),
                     generation: r.generation,
                     terrain: None,
+                    flags: f.flags.iter().map(|q| view3d::FlagDraw { foot: [q[0], q[1], q[2]], height: q[3], wind: f.air_velocity([q[0], q[1], q[2] + q[3]]) }).collect(),
                     objects: r.objects.clone(),
                     steered: f.objects.iter().enumerate().filter(|(_, o)| o.keys).map(|(i, _)| i).nth(self.steer),
                     blend: {

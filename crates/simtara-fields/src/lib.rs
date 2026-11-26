@@ -317,6 +317,10 @@ pub struct Fluid {
     /// Largest eddy viscosity of the last step, m²/s (sizes the GPU's diffusion steps).
     #[serde(default)]
     pub eddy_max: f32,
+    /// Flags that show the air's own velocity where they stand: x, y, z of the foot and pole
+    /// height, metres.
+    #[serde(default)]
+    pub flags: Vec<[f32; 4]>,
     /// Water particles: position (grid units) and velocity (m/s).
     pub particles: Vec<[f32; 6]>,
     /// APIC: how velocity changes around each particle (du/dx..dw/dz, m/s per cell).
@@ -488,6 +492,7 @@ impl Fluid {
             no_slip: false,
             lid: 0.0,
             eddy_max: 0.0,
+            flags: old.flags,
             particles: Vec::new(),
             affine: Vec::new(),
             emitters: Vec::new(),
@@ -1203,6 +1208,15 @@ impl Fluid {
                 sum / cells
             }
             _ => 0.0,
+        }
+    }
+
+    /// The air's velocity at a point (metres), m/s (zero outside the box or without air).
+    pub fn air_velocity(&self, p: [f32; 3]) -> [f32; 3] {
+        let ext = self.extent();
+        match self.mac.as_ref() {
+            Some(mac) if self.kind == Kind::Smoke && (0..3).all(|a| p[a] >= 0.0 && p[a] <= ext[a]) => mac.vel([p[0] / self.cell, p[1] / self.cell, p[2] / self.cell]),
+            _ => [0.0; 3],
         }
     }
 
@@ -1961,6 +1975,23 @@ fn register_commands(w: &mut World) {
             0
         };
         Ok(json!({"cells": n, "gas": gas::GASES[k].name, "molar_mass_kg_mol": gas::GASES[k].molar_mass}))
+    });
+    // flag{at = {x, y} or {x, y, z}, height = metres}: a flag that shows the wind where it stands
+    // (in a flood: the wind; in air: the air's own velocity at the top of its pole)
+    w.register_command("flag", |w, a| {
+        let at = match a.get("at") {
+            Some(Value::Array(v)) if (v.len() == 2 || v.len() == 3) && v.iter().all(Value::is_number) => v.iter().map(|x| x.as_f64().unwrap()).collect::<Vec<_>>(),
+            _ => return Err("flag needs at = {x, y} or {x, y, z} (metres)".into()),
+        };
+        if let Some(fl) = w.get_mut::<shallow::Flood>().filter(|f| f.ready()) {
+            let height = a.get("height").and_then(Value::as_f64).unwrap_or(fl.cell * 3.0);
+            fl.flags.push([at[0], at[1], height]);
+            return Ok(json!(fl.flags.len()));
+        }
+        let f = fluid_mut(w)?;
+        let height = a.get("height").and_then(Value::as_f64).unwrap_or(f.cell as f64 * 8.0) as f32;
+        f.flags.push([at[0] as f32, at[1] as f32, at.get(2).copied().unwrap_or(0.0) as f32, height]);
+        Ok(json!(f.flags.len()))
     });
     // water{box = {x0, y0, z0, x1, y1, z1}}: fill with still water
     w.register_command("water", |w, a| {

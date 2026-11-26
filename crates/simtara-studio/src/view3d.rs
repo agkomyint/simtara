@@ -132,6 +132,68 @@ pub struct Volume {
     pub steered: Option<usize>,
     /// Ground and flood water (from `simtara_fields::shallow::Flood`) instead of a box of cells.
     pub terrain: Option<Terrain>,
+    /// Flags showing the wind.
+    pub flags: Vec<FlagDraw>,
+}
+
+/// A flag on a pole: where its foot is and how tall the pole is (picture units), and the wind
+/// at its top (m/s).
+#[derive(Clone, Copy, Debug)]
+pub struct FlagDraw {
+    pub foot: [f32; 3],
+    pub height: f32,
+    pub wind: [f32; 3],
+}
+
+/// The pole of a flag: a thin square post, 1 tall, standing on z = 0.
+pub fn flag_pole() -> Mesh {
+    let r = 0.012;
+    let v = vec![[-r, -r, 0.0], [r, -r, 0.0], [r, r, 0.0], [-r, r, 0.0], [-r, -r, 1.0], [r, -r, 1.0], [r, r, 1.0], [-r, r, 1.0]];
+    let t = vec![[0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7], [4, 5, 6], [4, 6, 7]];
+    Mesh { v, t }
+}
+
+/// The cloth of a flag on a pole 1 tall, flying towards +x in a wind of `speed` m/s.
+/// How a real flag behaves, roughly: in still air it hangs down the pole; it lifts as the wind's
+/// push (which grows with the square of the speed) beats its weight, and is nearly straight out
+/// by about 8 m/s; waves run along it from the pole to the free end, faster in stronger wind
+/// (flutter at a Strouhal-like frequency of about 0.15 U / length). `length_m` is its real
+/// length, `t` the time in seconds.
+pub fn flag_cloth(speed: f32, length_m: f32, t: f32) -> Mesh {
+    let (len, wid) = (0.45f32, 0.3f32);
+    let (ns, nt) = (12usize, 3usize);
+    let lift = (speed / 4.0).powi(2).atan(); // angle from hanging straight down
+    let calm = (speed / 3.0).min(1.0);
+    let freq = 0.15 * speed / length_m.max(0.05);
+    let k = std::f32::consts::TAU / (0.7 * len);
+    let mut v = Vec::new();
+    for b in 0..=nt {
+        let z0 = 1.0 - wid * b as f32 / nt as f32;
+        for a in 0..=ns {
+            let s = len * a as f32 / ns as f32;
+            let wave = 0.08 * len * (s / len) * calm * (k * s - std::f32::consts::TAU * freq * t).sin();
+            // a little sag towards the free end, less the stronger the wind
+            let sag = 0.15 * s * (1.0 - calm * 0.8);
+            v.push([s * lift.sin(), wave, z0 - s * lift.cos() - sag * lift.sin()]);
+        }
+    }
+    let mut tri = Vec::new();
+    let w = (ns + 1) as u32;
+    for b in 0..nt as u32 {
+        for a in 0..ns as u32 {
+            let i = b * w + a;
+            tri.push([i, i + 1, i + w + 1]);
+            tri.push([i, i + w + 1, i + w]);
+        }
+    }
+    Mesh { v, t: tri }
+}
+
+/// Flag pieces placed in the world: (pole mesh, cloth mesh, foot, scale, heading in degrees).
+pub fn flag_parts(fl: &FlagDraw, t: f32) -> (Mesh, Mesh, f32) {
+    let speed = (fl.wind[0] * fl.wind[0] + fl.wind[1] * fl.wind[1]).sqrt();
+    let heading = fl.wind[1].atan2(fl.wind[0]).to_degrees();
+    (flag_pole(), flag_cloth(speed, fl.height * 0.45, t), heading)
 }
 
 /// A flood to draw: ground heights already in picture units (lowest ground at 0, times
@@ -153,7 +215,7 @@ pub struct Terrain {
 }
 
 /// The 3D view's picture of a flood.
-pub fn flood_volume(r: &simtara_fields::shallow::FloodRender, vertical: f32, wet: f32, blend: f32) -> Volume {
+pub fn flood_volume(r: &simtara_fields::shallow::FloodRender, vertical: f32, wet: f32, blend: f32, flags: &[[f64; 3]], wind: [f64; 2]) -> Volume {
     let low = r.bed.iter().cloned().fold(f32::MAX, f32::min);
     let top = r.bed.iter().zip(&r.depth).map(|(b, d)| b + d).fold(f32::MIN, f32::max);
     let size = [r.nx as f32 * r.cell, r.ny as f32 * r.cell, ((top - low) * vertical).max(r.cell) * 1.02];
@@ -168,6 +230,13 @@ pub fn flood_volume(r: &simtara_fields::shallow::FloodRender, vertical: f32, wet
         blend,
         objects: Vec::new(),
         steered: None,
+        flags: flags
+            .iter()
+            .map(|f| {
+                let (i, j) = (((f[0] / r.cell as f64) as usize).min(r.nx - 1), ((f[1] / r.cell as f64) as usize).min(r.ny - 1));
+                FlagDraw { foot: [f[0] as f32, f[1] as f32, (r.bed[j * r.nx + i] - low) * vertical], height: f[2] as f32 * vertical, wind: [wind[0] as f32, wind[1] as f32, 0.0] }
+            })
+            .collect(),
         terrain: Some(Terrain {
             nx: r.nx,
             ny: r.ny,
@@ -197,6 +266,34 @@ fn ground_colour(e: f32, building: bool, steep: bool) -> [f32; 3] {
         c = [0.47, 0.44, 0.40];
     }
     c
+}
+
+/// A flag drawn by the CPU painter: pole and cloth as flat-shaded triangles.
+fn cpu_flag(painter: &egui::Painter, view: &View, fl: &FlagDraw, time: f32, l: [f32; 3], light: &Light) {
+    let (pole, cloth, heading) = flag_parts(fl, time);
+    let (c, s) = (heading.to_radians().cos(), heading.to_radians().sin());
+    let place = |p: [f32; 3]| [fl.foot[0] + (p[0] * c - p[1] * s) * fl.height, fl.foot[1] + (p[0] * s + p[1] * c) * fl.height, fl.foot[2] + p[2] * fl.height];
+    let mut mesh = egui::Mesh::default();
+    for (m, col) in [(&pole, [0.75f32, 0.75, 0.78]), (&cloth, [0.85, 0.12, 0.10])] {
+        for t in &m.t {
+            let w = [place(m.v[t[0] as usize]), place(m.v[t[1] as usize]), place(m.v[t[2] as usize])];
+            let mut n = norm(cross(sub(w[1], w[0]), sub(w[2], w[0])));
+            if dot(n, sub(view.eye, w[0])) < 0.0 {
+                n = [-n[0], -n[1], -n[2]];
+            }
+            let k = (light.ambient as f32 + light.strength as f32 * dot(n, l).max(0.0)).min(1.4);
+            let colour = Color32::from_rgb((col[0] * k * 255.0).min(255.0) as u8, (col[1] * k * 255.0).min(255.0) as u8, (col[2] * k * 255.0).min(255.0) as u8);
+            let p: Vec<Pos2> = w.iter().filter_map(|q| view.project(*q).map(|x| x.0)).collect();
+            if p.len() == 3 {
+                let b = mesh.vertices.len() as u32;
+                for q in p {
+                    mesh.vertices.push(vertex(q, colour));
+                }
+                mesh.indices.extend_from_slice(&[b, b + 1, b + 2]);
+            }
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// The CPU painter's flood: a coarse grid of shaded quads, far ones first.
@@ -521,6 +618,12 @@ pub fn draw(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response, items: &[Ite
             }
         };
         painter.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+    }
+    if let Some(v) = volume {
+        let time = ui.input(|i| i.time) as f32;
+        for fl in &v.flags {
+            cpu_flag(&painter, &view, fl, time, l, light);
+        }
     }
     axes(&painter, rect, r, u);
     Out { hovered: hovered.map(|h| h.2), selected_at }

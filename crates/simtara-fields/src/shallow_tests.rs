@@ -176,3 +176,24 @@ fn lowering_a_gate_lets_the_reservoir_out() {
     assert!(downstream(&f) > 10.0, "the water rushes out: {}", downstream(&f));
 }
 
+
+/// Wind blowing along a closed lake piles the water up at the far end until the slope of the
+/// surface holds it back: g h d(eta)/dx = tau / rho (the "wind set-up" of storm surges).
+#[test]
+fn wind_piles_water_up_by_its_stress() {
+    let (n, dx, depth, u10) = (100usize, 100.0f64, 5.0f64, 20.0f64);
+    let mut f = basin(n, 1, dx, 60.0);
+    f.manning = Num::N(0.05);
+    f.wind_speed = Num::N(u10);
+    f.wind_dir = Num::N(0.0);
+    for c in 0..n {
+        f.h[c] = depth;
+    }
+    run(&mut f, 1440);
+    let tau = RHO_AIR * wind_drag(u10) * u10 * u10;
+    let want: f64 = (0..n - 1).map(|c| tau * dx / (f.density * f.gravity * 0.5 * (f.h[c] + f.h[c + 1]))).sum();
+    let got = f.h[n - 1] - f.h[0];
+    eprintln!("wind set-up: {got:.4} m, expected {want:.4} m (stress {tau:.3} Pa)");
+    assert!((got - want).abs() < 0.03 * want, "{got} vs {want}");
+    assert!(f.summary().iter().any(|m| m.0 == "wind.stress_pa" && (m.1 - tau).abs() < 1e-9));
+}

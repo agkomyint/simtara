@@ -48,14 +48,14 @@ fn contents(sim: &simtara_core::Simulation) -> (Vec<Item>, Option<Volume>) {
         }
         let d = f.dims();
         let water = f.kind == simtara_fields::Kind::Water;
-        volume = Some(Volume { dims: [d.nx as u32, d.ny as u32, d.nz as u32], size: f.extent(), data: r.rgba.clone(), water_radius: if water { f.cell * 0.55 } else { 0.0 }, caustics: r.caustics.clone(), liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()), generation: r.generation, blend: 1.0, objects: r.objects.clone(), steered: None, terrain: None });
+        volume = Some(Volume { dims: [d.nx as u32, d.ny as u32, d.nz as u32], size: f.extent(), data: r.rgba.clone(), water_radius: if water { f.cell * 0.55 } else { 0.0 }, caustics: r.caustics.clone(), liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()), generation: r.generation, blend: 1.0, objects: r.objects.clone(), steered: None, terrain: None, flags: f.flags.iter().map(|q| { let top = [q[0], q[1], q[2] + q[3]]; view3d::FlagDraw { foot: [q[0], q[1], q[2]], height: q[3], wind: f.air_velocity(top) } }).collect() });
     }
     if let Some(f) = sim.world().get::<simtara_fields::shallow::Flood>().filter(|f| f.ready()) {
         let mut copy = f.clone();
         copy.want_render = true;
         copy.make_render();
         let r = copy.render.unwrap_or_default();
-        volume = Some(view3d::flood_volume(&r, f.vertical.max(0.1) as f32, f.wet as f32, 1.0));
+        volume = Some(view3d::flood_volume(&r, f.vertical.max(0.1) as f32, f.wet as f32, 1.0, &f.flags, f.wind_now));
     }
     (items, volume)
 }

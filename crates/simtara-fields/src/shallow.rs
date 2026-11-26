@@ -148,6 +148,23 @@ pub struct Flood {
     /// how much the 3D view stretches heights (1 = true; a coast kilometres wide looks flat otherwise)
     #[serde(default)]
     pub vertical: f64,
+    /// density of the water, kg/m³ (fresh 1000, sea 1025)
+    #[serde(default = "fresh_water")]
+    pub density: f64,
+    /// wind 10 m above the water: speed (m/s) and the direction it blows towards (degrees,
+    /// 0 = east / +x, 90 = north / +y)
+    #[serde(default)]
+    pub wind_speed: Num,
+    #[serde(default)]
+    pub wind_dir: Num,
+    /// the wind of the last step, m/s (x, y), and the stress it puts on the water, Pa
+    #[serde(default)]
+    pub wind_now: [f64; 2],
+    #[serde(default)]
+    pub wind_stress: f64,
+    /// flags that show the wind: x, y (metres) and pole height (metres)
+    #[serde(default)]
+    pub flags: Vec<[f64; 3]>,
     pub seconds: f64,
     pub substeps: usize,
     /// water added by rain and rivers, m³
@@ -163,6 +180,19 @@ pub struct Flood {
     pub want_render: bool,
     #[serde(skip)]
     pub render: Option<std::sync::Arc<FloodRender>>,
+}
+
+fn fresh_water() -> f64 {
+    1000.0
+}
+
+/// Density of air at sea level and 20 °C, kg/m³.
+pub const RHO_AIR: f64 = 1.204;
+
+/// Drag of the wind on water (Wu 1982, C_d = (0.8 + 0.065 U10) / 1000), levelling off in
+/// storms as measured in hurricanes (Powell et al. 2003).
+pub fn wind_drag(u10: f64) -> f64 {
+    ((0.8 + 0.065 * u10.abs()) * 1e-3).min(2.5e-3)
 }
 
 /// One side of a cell, reconstructed: depth, ground, velocity.
@@ -233,6 +263,7 @@ impl Flood {
             edges: [Edge::Open; 4],
             wet: 0.01,
             vertical: 1.0,
+            density: 1000.0,
             metrics: old.metrics,
             want_render: old.want_render,
             changed: true,
@@ -470,6 +501,13 @@ impl Flood {
         self.apply_gates(params);
         self.apply_quakes(params);
         let manning = self.manning.get(params).max(0.0) as f64;
+        // wind: the stress it puts on the water, rho_air C_d |U| U (pascals)
+        let (ws, wd) = (self.wind_speed.get(params).max(0.0) as f64, (self.wind_dir.get(params) as f64).to_radians());
+        let wind = [ws * wd.cos(), ws * wd.sin()];
+        let tau = RHO_AIR * wind_drag(ws) * ws;
+        let push = [tau * wind[0] / self.density, tau * wind[1] / self.density];
+        self.wind_now = wind;
+        self.wind_stress = tau * ws;
         let rain: Vec<(f64, Option<[f64; 4]>)> = self.rain.iter().map(|r| (r.rate.get(params).max(0.0) as f64 / 1000.0 / 3600.0, r.region)).collect();
         let rivers: Vec<(Vec<usize>, f64, [f64; 2])> = self
             .rivers
@@ -511,6 +549,16 @@ impl Flood {
                         let f = 1.0 + k * speed / h.powf(4.0 / 3.0);
                         *qu /= f;
                         *qv /= f;
+                    }
+                });
+            }
+            // the wind drags the surface along
+            if ws > 0.0 {
+                let (h, hu, hv) = (&self.h, &mut self.hu, &mut self.hv);
+                hu.par_iter_mut().zip(hv.par_iter_mut()).zip(h.par_iter()).for_each(|((qu, qv), h)| {
+                    if *h > 1e-3 {
+                        *qu += sdt * push[0];
+                        *qv += sdt * push[1];
                     }
                 });
             }
@@ -695,6 +743,8 @@ impl Flood {
             ("flood.deepest_on_land_m".into(), deepest),
             ("flood.fastest_m_s".into(), fastest),
             ("flood.substeps".into(), self.substeps as f64),
+            ("wind.speed_m_s".into(), (self.wind_now[0].powi(2) + self.wind_now[1].powi(2)).sqrt()),
+            ("wind.stress_pa".into(), self.wind_stress),
         ];
         if runup > f64::MIN {
             out.push(("flood.highest_reached_m".into(), runup - self.sea_level));
@@ -905,6 +955,9 @@ fn register_commands(w: &mut World) {
         if let Some(s) = a.get("sea_level").and_then(Value::as_f64) {
             f.sea_level = s;
         }
+        if let Some(v) = a.get("density").and_then(Value::as_f64) {
+            f.density = v.max(1.0);
+        }
         if let Some(v) = a.get("vertical").and_then(Value::as_f64) {
             f.vertical = v.clamp(0.1, 100.0);
         }
@@ -1017,6 +1070,17 @@ fn register_commands(w: &mut World) {
             }
         }
         Ok(json!(n))
+    });
+    // wind{speed = m/s, direction = degrees it blows towards (0 = east, 90 = north)}: both may be controls
+    w.register_command("wind", |w, a| {
+        let f = flood_mut(w)?;
+        if let Some(s) = number(a, "speed")? {
+            f.wind_speed = s;
+        }
+        if let Some(d) = number(a, "direction")? {
+            f.wind_dir = d;
+        }
+        Ok(json!(true))
     });
     // rain{rate = mm per hour, box = {...}?}
     w.register_command("rain", |w, a| {

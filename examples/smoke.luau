@@ -17,6 +17,10 @@ function setup()
   solid{box = {3.3, 1.9, 1.8, 3.5, 2.1, 2.3}}               -- its chimney
   emitter{at = {3.4, 2.0, 2.45}, radius = 0.12, smoke = "chimney", heat = "heat", velocity = {0, 0, 1}}
   emitter{at = {0.8, 2.0, 0.35}, radius = 0.25, smoke = "ground_smoke"}
+  -- flags show the air's own velocity where they stand: upwind, on the roof, in the wake
+  flag{at = {1.6, 1.2, 0}, height = 1.4}
+  flag{at = {2.9, 1.6, 1.8}, height = 0.6}
+  flag{at = {4.6, 2.3, 0}, height = 1.4}
 
   fluid_metric{name = "smoke behind the building", field = "smoke", op = "sum", box = {3.6, 0, 0, 6, 4, 2}}
   fluid_metric{name = "hottest air (°C above)", field = "temp", op = "max"}

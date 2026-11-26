@@ -6,12 +6,15 @@
 --   water, then running up the beach and through the streets.
 --   Solved with the shallow-water equations (the method tsunami warning centres use), checked
 --   against the Synolakis run-up experiment and exact dam-break solutions.
--- Try: a bigger uplift, rougher ground (more friction slows the flood), a different quake place.
+-- Try: a bigger uplift, rougher ground (more friction slows the flood), a storm wind of 40 m/s
+-- onto the shore (it piles the sea up against the coast, as a storm surge does).
 function setup()
   param{name = "uplift", value = 8, min = 0, max = 12, about = "how far the sea floor lifts in the earthquake, m", owner = "nature"}
   param{name = "roughness", value = 0.03, min = 0.01, max = 0.1, about = "Manning roughness of the ground (0.015 concrete, 0.03 grass, 0.1 forest)", owner = "nature"}
+  param{name = "wind", value = 12, min = 0, max = 60, about = "wind speed 10 m above the sea, m/s (storm 25, hurricane 50+)", owner = "nature"}
+  param{name = "wind_dir", value = 0, min = 0, max = 360, about = "direction the wind blows towards, degrees (0 = east, onto the shore; 90 = north)", owner = "nature"}
 
-  flood{size = {200, 150}, cell = 20, dt = 1, manning = "roughness", vertical = 4, sea_level = 0,
+  flood{size = {200, 150}, cell = 20, dt = 1, manning = "roughness", vertical = 4, sea_level = 0, density = 1025,
         edges = {west = "open", north = "open", south = "open", east = "wall"}}
   -- sea floor rising to the beach, land rising behind it
   ground{ramp = {0, 0, -60, 2500, 0, -2}}
@@ -34,6 +37,10 @@ function setup()
     end
   end
   water_level{level = 0}
+  -- the wind drags on the sea (storm surge); the flags show where it blows
+  wind{speed = "wind", direction = "wind_dir"}
+  flag{at = {2760, 1450}, height = 40}
+  flag{at = {3300, 1950}, height = 40}
   quake{at = {1000, 1500}, size = {500, 1100}, uplift = "uplift", when = 3}
 
   flood_metric{name = "town flooded (m²)", field = "wet", op = "sum", box = {2790, 1000, 3270, 1900}}

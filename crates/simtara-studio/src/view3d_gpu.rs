@@ -192,6 +192,8 @@ pub struct Gpu3d {
     water: crate::view3d_water::Water,
     terrain: crate::view3d_terrain::Terrain3d,
     meshes: HashMap<String, GpuMesh>,
+    /// for the flags' flutter
+    clock: std::time::Instant,
 }
 
 impl Gpu3d {
@@ -317,7 +319,7 @@ impl Gpu3d {
         let solids_pipe = full("simtara 3d solids", "fs_solids", &vol_pl, true, wgpu::CompareFunction::Less);
         let pool_pipe = full("simtara 3d pool", "fs_pool", &vol_pl, true, wgpu::CompareFunction::Less);
         let caustics = Self::caustics_group(&device, &queue, &vol_layout, &sampler, 1, 1, &[85]);
-        Gpu3d { device, queue, uniforms, bind, ground, balls, meshes_pipe, vol_pipe, vol_layout, sampler, vol: None, sky_pipe, solids_pipe, pool_pipe, caustics, uploaded: 0, target: None, ball_inst: GrowBuf::default(), mist, mist_inst: GrowBuf::default(), water, terrain, meshes: HashMap::new() }
+        Gpu3d { device, queue, uniforms, bind, ground, balls, meshes_pipe, vol_pipe, vol_layout, sampler, vol: None, sky_pipe, solids_pipe, pool_pipe, caustics, uploaded: 0, target: None, ball_inst: GrowBuf::default(), mist, mist_inst: GrowBuf::default(), water, terrain, meshes: HashMap::new(), clock: std::time::Instant::now() }
     }
 
     fn ensure_target(&mut self, size: [u32; 2]) -> bool {
@@ -416,6 +418,31 @@ impl Gpu3d {
             draws.push((name.to_string(), (bytes.len() as u64 / INST) as u32));
         }
 
+        // flags: a pole and a cloth that flies with the wind, rebuilt every frame (it flutters)
+        if let Some(v) = volume {
+            let time = self.clock.elapsed().as_secs_f32();
+            for (k, fl) in v.flags.iter().enumerate() {
+                let (pole, cloth, heading) = crate::view3d::flag_parts(fl, time + k as f32 * 0.37);
+                let size = fl.height / (2.0 * u.unit.max(1e-9));
+                for (name, mesh, colour) in [(format!("flag pole {k}"), pole, egui::Color32::from_rgb(190, 190, 198)), (format!("flag cloth {k}"), cloth, egui::Color32::from_rgb(215, 30, 26))] {
+                    let data = mesh_bytes(&mesh);
+                    let count = (mesh.t.len() * 3) as u32;
+                    let same = self.meshes.get(&name).is_some_and(|g| g.count == count);
+                    if same {
+                        self.queue.write_buffer(&self.meshes[&name].verts, 0, &data);
+                    } else {
+                        let verts = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("simtara 3d flag"), size: (data.len() as u64).max(VERT), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                        self.queue.write_buffer(&verts, 0, &data);
+                        self.meshes.insert(name.clone(), GpuMesh { key: (0, 0, 0), verts, count, inst: GrowBuf::default() });
+                    }
+                    let mut inst = Vec::new();
+                    push_instance(&mut inst, &Item { id: 0, pos: fl.foot, color: colour, size, heading, shape: String::new() });
+                    let g = self.meshes.get_mut(&name).unwrap();
+                    g.inst.write(&self.device, &self.queue, &inst);
+                    draws.push((name, 1));
+                }
+            }
+        }
         let mists = (mist_bytes.len() as u64 / INST) as u32;
         self.mist_inst.write(&self.device, &self.queue, &mist_bytes);
         let pool = u.pool && volume.is_some();
@@ -1203,7 +1230,7 @@ mod tests {
         for c in 0..(n * n * n) as usize {
             data[c * 4] = 26;
         }
-        let vol = Volume { dims: [n; 3], size: [2.0; 3], data, water_radius: 0.0, caustics: None, liquid: None, generation: 0, blend: 1.0, objects: Vec::new(), steered: None, terrain: None };
+        let vol = Volume { dims: [n; 3], size: [2.0; 3], data, water_radius: 0.0, caustics: None, liquid: None, generation: 0, blend: 1.0, objects: Vec::new(), steered: None, terrain: None, flags: Vec::new() };
         let mut u = camera(false);
         u.eye = [1.0, 10.0, 1.0];
         let size = [64, 64];
@@ -1252,7 +1279,7 @@ mod tests {
                 }
             }
         }
-        let vol = Volume { dims: [n; 3], size: [1.0; 3], data: vec![0; (n * n * n * 4) as usize], water_radius: 0.03, caustics: None, liquid: Some(field), generation: 0, blend: 1.0, objects: Vec::new(), steered: None, terrain: None };
+        let vol = Volume { dims: [n; 3], size: [1.0; 3], data: vec![0; (n * n * n * 4) as usize], water_radius: 0.03, caustics: None, liquid: Some(field), generation: 0, blend: 1.0, objects: Vec::new(), steered: None, terrain: None, flags: Vec::new() };
         let mut u = camera(false);
         u.eye = [0.5, 4.0, 0.5];
         u.ambient = 0.5;
