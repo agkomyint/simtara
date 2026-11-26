@@ -257,6 +257,10 @@ pub struct BuildView {
     /// The fluid step last drawn and when it arrived; the usual time between steps (seconds).
     step_seen: (u64, std::time::Instant),
     step_gap: f32,
+    /// the steering keys last seen (and the camera's turn), so controls change only when they do
+    keys_held: [i32; 4],
+    /// the 3D view's widget id (it takes the keyboard when clicked)
+    view_id: Option<egui::Id>,
     /// frames per second of the window (smoothed), and when the last frame started
     fps: f32,
     frame_at: std::time::Instant,
@@ -324,6 +328,8 @@ impl BuildView {
             draw_ms: 0.0,
             step_seen: (0, std::time::Instant::now()),
             step_gap: 0.1,
+            keys_held: [0; 4],
+            view_id: None,
             fps: 0.0,
             frame_at: std::time::Instant::now(),
             models: std::collections::HashMap::new(),
@@ -438,6 +444,22 @@ impl BuildView {
         let ax = (r as i32 - l as i32) as f32;
         let ay = (fwd as i32 - back as i32) as f32;
         let az = (up as i32 - down as i32) as f32;
+        // only when the keys change (pressed or let go): otherwise the sliders are left alone,
+        // so a ball can be driven from the Controls too
+        let held = [ax as i32, ay as i32, az as i32, (yaw * 10.0) as i32];
+        if held == self.keys_held {
+            return;
+        }
+        self.keys_held = held;
+        // another widget (a slider) has the keyboard: the keys are for it, not the ball
+        let other_focus = ui.ctx().memory(|m| m.focused()).is_some_and(|id| Some(id) != self.view_id);
+        if other_focus && (ax != 0.0 || ay != 0.0 || az != 0.0) {
+            self.status = "click the 3D view first, then the arrow keys steer the ball".into();
+            return;
+        }
+        if self.sim.run_state() != RunState::Running && (ax != 0.0 || ay != 0.0 || az != 0.0) {
+            self.status = "press ▶ Start: objects move while the universe runs".into();
+        }
         for ob in f.objects.iter().filter(|o| o.keys) {
             let v = [(ax * rx + ay * fx) * ob.speed, (ax * ry + ay * fy) * ob.speed, az * ob.speed];
             for a in 0..3 {
@@ -920,6 +942,7 @@ impl BuildView {
                 [p.cos() * y.cos(), p.cos() * y.sin(), p.sin()]
             };
             let on_gpu = self.gpu3d.is_some();
+            let steerable = fluid.is_some_and(|f| f.objects.iter().any(|o| o.keys));
             let mut volume = None;
             if let Some(f) = fluid {
                 let d = f.dims();
@@ -971,6 +994,11 @@ impl BuildView {
                     }
                 }
             }
+            // clicking or dragging the view gives it the keyboard (for steering objects)
+            self.view_id = Some(resp.id);
+            if resp.clicked() || resp.drag_started() {
+                resp.request_focus();
+            }
             let out = view3d::draw(ui, resp.rect, &resp, &items, &mut cam, &light, &self.models, self.selected, self.gpu3d.as_mut(), volume.as_ref());
             self.draw_ms = self.draw_ms * 0.9 + t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
             if resp.clicked() {
@@ -991,7 +1019,7 @@ impl BuildView {
                     .collect();
                 painter.text(resp.rect.left_bottom() + egui::vec2(80.0, -8.0), egui::Align2::LEFT_BOTTOM, format!("#{} {}   {}", th.id, th.kind, props.join("  ")), egui::FontId::monospace(12.0), egui::Color32::WHITE);
             }
-            painter.text(resp.rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · 3D · {} {:.1} ms · {:.0} fps · drag to turn, scroll to zoom", if self.gpu3d.is_some() { "GPU" } else { "CPU" }, self.draw_ms, self.fps), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
+            painter.text(resp.rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · 3D · {} {:.1} ms · {:.0} fps · drag to turn, scroll to zoom{}", if self.gpu3d.is_some() { "GPU" } else { "CPU" }, self.draw_ms, self.fps, if steerable { " · arrow keys / WASD steer, E/Q up/down" } else { "" }), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
             self.pick = new_pick;
             self.show_links = Some(links_on);
             let cam_changed = (cam.yaw, cam.pitch, cam.distance, cam.fov, cam.follow) != (cam0.yaw, cam0.pitch, cam0.distance, cam0.fov, cam0.follow);
