@@ -3,6 +3,12 @@
 
 mod build;
 mod view3d;
+mod view3d_gpu;
+mod view3d_water;
+mod picture;
+
+/// Key under which the window's wgpu device is kept in egui's data store.
+pub const RENDER_STATE: &str = "simtara wgpu render state";
 
 use eframe::egui;
 use simtara_core::{Backend, Config, Simulation, Snapshot};
@@ -1027,6 +1033,21 @@ fn main() -> eframe::Result {
     let saved = store.list();
     // `simtara-studio --open "My universe"` skips the launcher.
     let args: Vec<String> = std::env::args().collect();
+    // `simtara-studio --picture FILE.luau --ticks 30,60 --out frame --size 960x600`: pictures without a window
+    if let Some(file) = args.iter().position(|a| a == "--picture").and_then(|i| args.get(i + 1)) {
+        let get = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+        let ticks: Vec<u64> = get("--ticks").unwrap_or_else(|| "60".into()).split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        let size = get("--size").and_then(|s| s.split_once('x').and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))).unwrap_or([960, 600]);
+        let obj = args.iter().any(|a| a == "--obj");
+        match picture::run(file, &ticks, &get("--out").unwrap_or_else(|| "frame".into()), size, obj) {
+            Ok(paths) => paths.iter().for_each(|p| println!("{p}")),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let mut notice = String::new();
     let mut screen = Screen::Launcher;
     if let Some(name) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
@@ -1056,5 +1077,15 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1250.0, 920.0]).with_title("SimTara Studio"),
         ..Default::default()
     };
-    eframe::run_native("SimTara Studio", opts, Box::new(|_| Ok(Box::new(studio))))
+    eframe::run_native(
+        "SimTara Studio",
+        opts,
+        Box::new(|cc| {
+            // the 3D view draws on this device when there is one (see view3d_gpu)
+            if let Some(rs) = &cc.wgpu_render_state {
+                cc.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::unique(RENDER_STATE), rs.clone()));
+            }
+            Ok(Box::new(studio))
+        }),
+    )
 }

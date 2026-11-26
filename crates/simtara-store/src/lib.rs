@@ -138,6 +138,7 @@ pub fn build_simulation(config: &Config) -> Simulation {
     let mut sim = Simulation::new(config.clone());
     if template_of(config) == TEMPLATE_BUILD {
         sim.add_module(simtara_things::ThingsModule);
+        sim.add_module(simtara_fields::FluidModule);
         if config.modules.contains_key(simtara_orbits::MODULE) {
             sim.add_module(simtara_orbits::OrbitModule);
         }

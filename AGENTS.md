@@ -10,6 +10,7 @@ Vocabulary: Template -> Universe -> Experiment -> Run. A Project is a folder. Pa
 |---|---|
 | `simtara-core` | `Simulation`, `World` (clock, systems, events, snapshots, command registry: `register_command` / `call` / `command_names`), compute backend |
 | `simtara-things` | Things (properties, relations), rules (formula language), metrics, params/roles, view, camera, light |
+| `simtara-fields` | Fluids in SI units: smoke (stable fluids, MAC grid) and water (FLIP); commands `fluid solid emitter water fluid_metric fluid_info`; any number may name a param |
 | `simtara-script` | Luau sandbox: `setup()` runs once at tick 0, `on_tick(t)` each tick; every registered command is a Luau function taking one table |
 | `simtara-store` | Saves universes and experiments as folders |
 | `simtara-studio` | egui desktop app (launcher, Build screen, 3D view) |
@@ -58,14 +59,15 @@ Quirks: params resolve after thing properties (a property with the same name win
 
 ## Studio and files
 
+- Pictures and meshes without a window: `simtara-studio --picture FILE.luau --ticks 30,80 --out frame [--obj] [--size 960x600]` (PNG of the 3D view; `--obj` adds the liquid surface mesh). Look at the PNGs to check visual changes.
 - Run Studio: `simtara-studio` (`--open "<name>"`, or `--new NAME --example "title substring"`). Kill a running copy before rebuilding on Windows: `taskkill //F //IM simtara-studio.exe`.
 - Saved universes live in `$SIMTARA_HOME` or `Documents/SimTara/universes/<name>/`: `universe.json`, `state.snap.json`, `script.luau`, `models/*.obj`, experiment files (`experiment.json`, `results.json`, `start.snap.json`).
-- 3D: CPU drawing through egui (no GPU 3D). `shape` property is `sphere | cube | pyramid | <model file name>`; `heading` (degrees) rotates a thing. `.obj` models are z-up, normalised to size 1; put `# simtara up=y` in the header for y-up files. Over 20,000 things it draws squares; models are capped near 350k triangles per frame.
-- Examples live in `examples/*.luau` (`fire`, `reaction`, `idea`, `balls3d`) and are embedded in `crates/simtara-studio/src/build.rs` (`EXAMPLES`, `REFERENCE` arrays have fixed lengths: update the number when adding).
+- 3D: drawn on the GPU (`view3d_gpu.rs`, wgpu offscreen texture shown as an egui image) with the CPU egui painter (`view3d.rs`) as fallback and behind the GPU checkbox. Both share the camera maths and mouse picking in `view3d.rs`; GPU tests read pixels back and skip when there is no adapter. `shape` property is `sphere | cube | pyramid | <model file name>`; `heading` (degrees) rotates a thing. `.obj` models are z-up, normalised to size 1; put `# simtara up=y` in the header for y-up files. Over 20,000 things it draws squares; models are capped near 350k triangles per frame.
+- Examples live in `examples/*.luau` (`fire`, `reaction`, `idea`, `balls3d`, `airflow`, `smoke`, `plume`, `water`) and are embedded in `crates/simtara-studio/src/build.rs` (`EXAMPLES`, `REFERENCE` arrays have fixed lengths: update the number when adding).
 
 ## Known gaps / backlog
 
-Fire example costs ~9 ms/tick for 3,600 cells (unexplained; 100k things x 5 ticks is ~120 ms); no bulk spawn (`grid{}`, `spawn_many`); no spatial neighbour-by-distance query; no `use("module")`; things/rules not in the HTTP API; no CLI `--set name=value`; crew cost is paid even when no fire; people/water/maps modules, Python SDK, `.simtara` packages and hosted compute are not started.
+Fire example costs ~9 ms/tick for 3,600 cells (unexplained; 100k things x 5 ticks is ~120 ms); no bulk spawn (`grid{}`, `spawn_many`); no spatial neighbour-by-distance query; liquids run on the GPU (`gpu_liquid.wgsl`, CPU fallback; GPU and CPU agree closely but not bit-for-bit), smoke on the CPU only (~45 ms/tick at 128k cells) and are not coupled to things; fluid snapshots are large JSON; no `use("module")`; things/rules not in the HTTP API; no CLI `--set name=value`; crew cost is paid even when no fire; people/water/maps modules, Python SDK, `.simtara` packages and hosted compute are not started.
 
 ## Conventions
 

@@ -3200,6 +3200,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "simtara-fields"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "rayon",
+ "serde",
+ "serde_json",
+ "simtara-core",
+ "simtara-things",
+ "wgpu",
+]
+
+[[package]]
 name = "simtara-gpu"
 version = "0.2.0"
 dependencies = [
@@ -3248,6 +3262,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simtara-core",
+ "simtara-fields",
  "simtara-orbits",
  "simtara-particles",
  "simtara-script",
@@ -3259,8 +3274,12 @@ name = "simtara-studio"
 version = "0.2.0"
 dependencies = [
  "eframe",
+ "png 0.17.16",
+ "pollster",
+ "rayon",
  "serde_json",
  "simtara-core",
+ "simtara-fields",
  "simtara-gpu",
  "simtara-orbits",
  "simtara-particles",

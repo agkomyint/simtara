@@ -387,7 +387,7 @@ fn register_commands(w: &mut World) {
     w.register_command("camera", |w, a| {
         let c = &mut things_mut(w)?.camera;
         let num = |k: &str| a.get(k).and_then(Value::as_f64);
-        if let Some(v) = num("yaw") { c.yaw = v; }
+        if let Some(v) = num("yaw") { c.yaw = (v + 180.0).rem_euclid(360.0) - 180.0; }
         if let Some(v) = num("pitch") { c.pitch = v.clamp(-89.0, 89.0); }
         if let Some(v) = num("distance") { c.distance = v.clamp(0.05, 50.0); }
         if let Some(v) = num("fov") { c.fov = v.clamp(0.0, 120.0); }

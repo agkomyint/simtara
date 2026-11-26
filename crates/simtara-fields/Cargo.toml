@@ -1,0 +1,16 @@
+[package]
+name = "simtara-fields"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fluids for SimTara: smoke (stable fluids on a staggered grid) and water (FLIP particles), in real units"
+
+[dependencies]
+simtara-core = { path = "../simtara-core" }
+simtara-things = { path = "../simtara-things" }
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+wgpu = "30"
+pollster = "1"
+bytemuck = "1"

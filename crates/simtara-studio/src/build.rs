@@ -13,12 +13,17 @@ use simtara_things::Things;
 use crate::view3d;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXAMPLES: [(&str, &str, &str); 9] = [
+pub const EXAMPLES: [(&str, &str, &str); 14] = [
     ("Empty universe", "A blank page with a few hints. Describe what exists, then the rules.", EMPTY),
     ("An idea spreads", "1,500 people, 3 of them know an idea. Each tells friends. No physics at all.", IDEA),
     ("Forest fire (physics + chemistry)", "Fuel, heat and oxygen. Turn oxygen, rain and ignition temperature while it burns.", include_str!("../../../examples/fire.luau")),
     ("Chemical reaction patterns", "Two chemicals react and diffuse: spots, stripes and mazes grow. Turn feed and kill.", include_str!("../../../examples/reaction.luau")),
     ("Bouncing things (3D)", "120 balls, cubes, pyramids and ships bouncing. Turn the camera and light, change gravity and wind, shake as a human.", include_str!("../../../examples/balls3d.luau")),
+    ("Smoke and wind around a building (3D)", "A real fluid in metres and seconds: wind flows around a building, a hot chimney's smoke rises and swirls in the wake.", include_str!("../../../examples/smoke.luau")),
+    ("Fire plume (3D smoke and heat)", "A fire heats the air; the hot column rises, curls into a mushroom and breaks into swirls around a beam.", include_str!("../../../examples/plume.luau")),
+    ("Water: a dam breaks (3D)", "75,000 water particles (FLIP): a wall of water crashes into a block, splashes up the far wall and settles.", include_str!("../../../examples/water.luau")),
+    ("Pour a real liquid into a glass (3D)", "Real viscosity and density: honey, water, olive oil, milk, mercury... poured into a glass at real size. Change LIQUID at the top.", include_str!("../../../examples/pour.luau")),
+    ("Airflow around a building (3D)", "A wind tunnel of 6,000 air cells. Smoke streaks show the air going around a building. Turn wind, viscosity and gusts.", include_str!("../../../examples/airflow.luau")),
     ("Heat on a plate", "A 40x40 plate with a hot square in the middle. Heat spreads to neighbours. Watch the picture.", HEAT),
     ("Towns and a disease", "Four towns of people, mostly meeting their own town. Watch the disease jump between towns.", TOWNS),
     ("Typed (Luau types)", "The same crowd, written with Luau type annotations so mistakes are caught early.", TYPED),
@@ -243,6 +248,17 @@ pub struct BuildView {
     /// x, y, colour, size chosen in the picture (None = what the script said; empty = none)
     pick: [Option<String>; 6],
     mode3d: Option<bool>,
+    /// Draw the 3D view on the graphics card (falls back to the CPU painter when there is none).
+    gpu3d_on: bool,
+    gpu3d: Option<crate::view3d_gpu::GpuView>,
+    /// Time the last 3D picture took to prepare and hand over, in ms (CPU or GPU).
+    draw_ms: f32,
+    /// The fluid step last drawn and when it arrived; the usual time between steps (seconds).
+    step_seen: (u64, std::time::Instant),
+    step_gap: f32,
+    /// frames per second of the window (smoothed), and when the last frame started
+    fps: f32,
+    frame_at: std::time::Instant,
     models: std::collections::HashMap<String, view3d::Mesh>,
     models_for: Option<String>,
     model_errors: Vec<String>,
@@ -261,6 +277,13 @@ pub struct BuildView {
     test_ticks: u64,
     test_checks: String,
     report: Option<Value>,
+}
+
+/// Water is blue, and white where it is spray (`foam` from `Fluid::water_points`).
+pub fn water_colour(foam: f32) -> egui::Color32 {
+    let foam = foam.clamp(0.0, 1.0);
+    let mix = |a: f32, b: f32| (a + (b - a) * foam) as u8;
+    egui::Color32::from_rgb(mix(30.0, 225.0), mix(105.0, 238.0), mix(215.0, 255.0))
 }
 
 fn make(seed: u64, script: &str, speed: f64) -> Simulation {
@@ -295,6 +318,13 @@ impl BuildView {
             zoom: 1.0,
             pick: Default::default(),
             mode3d: None,
+            gpu3d_on: true,
+            gpu3d: None,
+            draw_ms: 0.0,
+            step_seen: (0, std::time::Instant::now()),
+            step_gap: 0.1,
+            fps: 0.0,
+            frame_at: std::time::Instant::now(),
             models: std::collections::HashMap::new(),
             models_for: None,
             model_errors: Vec::new(),
@@ -393,8 +423,27 @@ impl BuildView {
         let (mut run_start, mut run_live, mut do_save) = (false, false, false);
         let t0 = std::time::Instant::now();
         self.poll_experiment(store);
-        self.sim.run_frame();
-        self.ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let dt = self.frame_at.elapsed().as_secs_f32().max(1e-4);
+        self.frame_at = std::time::Instant::now();
+        self.fps = if self.fps == 0.0 { 1.0 / dt } else { self.fps * 0.9 + 0.1 / dt };
+        // a fluid makes what the 3D view draws with each step, on its own thread
+        let sun = self.sim.world().get::<Things>().map(|t| {
+            let (y, p) = ((t.light.yaw as f32).to_radians(), (t.light.pitch as f32).to_radians());
+            [p.cos() * y.cos(), p.cos() * y.sin(), p.sin()]
+        });
+        if let (Some(sun), Some(f)) = (sun, self.sim.world_mut().get_mut::<simtara_fields::Fluid>()) {
+            f.want_render = true;
+            f.sun = sun;
+        }
+        // Fluids compute their next step on another thread. While it is not ready, skip the tick
+        // and keep drawing, so turning the camera stays smooth however slow the fluid is.
+        let fluid_busy = self.sim.world().get::<simtara_fields::Fluid>().is_some_and(|f| f.busy());
+        if self.sim.run_state() == RunState::Running && fluid_busy {
+            ui.ctx().request_repaint();
+        } else {
+            self.sim.run_frame();
+            self.ms = t0.elapsed().as_secs_f32() * 1000.0;
+        }
         self.record();
 
         egui::Panel::top("build_top").show(ui, |ui| {
@@ -560,8 +609,9 @@ impl BuildView {
             ui.weak("This universe has no things to draw.");
             return;
         };
-        if t.things.is_empty() {
-            ui.weak("Nothing exists yet. Create things with spawn{...} in setup().");
+        let fluid = self.sim.world().get::<simtara_fields::Fluid>().filter(|f| f.ready());
+        if t.things.is_empty() && fluid.is_none() {
+            ui.weak("Nothing exists yet. Create things with spawn{...} or a fluid{...} in setup().");
             return;
         }
         let mut param_edits: Vec<(String, f64)> = Vec::new();
@@ -727,7 +777,8 @@ impl BuildView {
         };
         let base = if n > 50_000 { 1.2 } else if n > 5_000 { 2.0 } else if n > 800 { 3.0 } else { 5.0 };
 
-        let three = self.mode3d.unwrap_or(match t.view.mode.as_deref() {
+        // smoke and water only make sense in 3D
+        let three = fluid.is_some() || self.mode3d.unwrap_or(match t.view.mode.as_deref() {
             Some("3d") => true,
             Some(_) => false,
             None => chosen[4].is_some(),
@@ -738,10 +789,22 @@ impl BuildView {
             let (cam0, light0) = (cam.clone(), light.clone());
             ui.horizontal_wrapped(|ui| {
                 ui.label("camera");
-                ui.add(egui::Slider::new(&mut cam.yaw, -360.0..=360.0).text("turn"));
+                cam.yaw = view3d::wrap_degrees(cam.yaw);
+                ui.add(egui::Slider::new(&mut cam.yaw, -180.0..=180.0).text("turn"));
                 ui.add(egui::Slider::new(&mut cam.pitch, -89.0..=89.0).text("tilt"));
                 ui.add(egui::Slider::new(&mut cam.distance, 0.05..=5.0).logarithmic(true).text("distance"));
                 ui.add(egui::Slider::new(&mut cam.fov, 0.0..=120.0).text("lens").custom_formatter(|n, _| if n < 1.0 { "flat".into() } else { format!("{n:.0}°") }));
+                // jump straight to a side: the camera on the -x side, the -y side, or above
+                for (label, yaw, pitch, tip) in [("x", 180.0, 8.0, "Look along x (from the -x side)"), ("y", -90.0, 8.0, "Look along y (from the -y side)"), ("top", -90.0, 89.0, "Look down from above")] {
+                    if ui.small_button(label).on_hover_text(tip).clicked() {
+                        cam.yaw = yaw;
+                        cam.pitch = pitch;
+                    }
+                }
+                let has_gpu = ui.ctx().data(|d| d.get_temp::<eframe::egui_wgpu::RenderState>(egui::Id::unique(crate::RENDER_STATE))).is_some();
+                ui.add_enabled(has_gpu, egui::Checkbox::new(&mut self.gpu3d_on, "GPU"))
+                    .on_hover_text("Draw on the graphics card (fast, real depth). Off = the CPU painter.")
+                    .on_disabled_hover_text("No graphics card available: drawing on the CPU.");
                 if let Some(id) = self.selected {
                     if ui.selectable_label(cam.follow == id, format!("follow #{id}")).clicked() {
                         cam.follow = if cam.follow == id { 0 } else { id };
@@ -756,6 +819,19 @@ impl BuildView {
                 ui.add(egui::Slider::new(&mut light.strength, 0.0..=1.5).text("strength"));
                 ui.checkbox(&mut light.ground, "ground");
                 ui.checkbox(&mut light.grid, "grid");
+                if let Some(f) = self.sim.world().get::<simtara_fields::Fluid>().filter(|f| f.ready() && !f.particles.is_empty()) {
+                    if ui.small_button("💧 export water mesh").on_hover_text("Save the water surface of this moment as an .obj (metres, z up) for Blender, Maya, Houdini ...").clicked() {
+                        let mesh = f.surface_mesh(2);
+                        let dir = store.root().join("exports");
+                        let tick = self.sim.world().clock.tick;
+                        let name = simtara_store::clean_name(&self.name_input).unwrap_or_else(|_| "universe".into());
+                        let path = dir.join(format!("{name}-water-{tick}.obj"));
+                        self.status = match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, mesh.to_obj("water"))) {
+                            Ok(()) => format!("saved {} ({} triangles)", path.display(), mesh.triangles.len()),
+                            Err(e) => format!("could not save the mesh: {e}"),
+                        };
+                    }
+                }
                 if let Some(name) = self.saved_as.clone() {
                     if ui.small_button("📁 models").on_hover_text("Open this project's models folder; drop .obj files there, then reload").clicked() {
                         if let Ok(d) = store.models_dir(&name) {
@@ -771,7 +847,7 @@ impl BuildView {
             for e in &self.model_errors {
                 ui.colored_label(egui::Color32::LIGHT_RED, e);
             }
-            let items: Vec<view3d::Item> = pts
+            let mut items: Vec<view3d::Item> = pts
                 .iter()
                 .map(|(id, p, th)| {
                     let z = num(th, &chosen[4]).unwrap_or(0.0);
@@ -789,7 +865,73 @@ impl BuildView {
                 .collect();
             let size = ui.available_size_before_wrap();
             let (resp, _) = ui.allocate_painter(egui::vec2(size.x, (size.y - 10.0).max(200.0)), egui::Sense::click_and_drag());
-            let out = view3d::draw(ui, resp.rect, &resp, &items, &mut cam, &light, &self.models, self.selected);
+            // GPU when the window has a wgpu device and the user has not switched it off
+            let render_state = ui.ctx().data(|d| d.get_temp::<eframe::egui_wgpu::RenderState>(egui::Id::unique(crate::RENDER_STATE)));
+            if !self.gpu3d_on {
+                self.gpu3d = None;
+            } else if self.gpu3d.is_none() {
+                self.gpu3d = render_state.clone().map(crate::view3d_gpu::GpuView::new);
+            }
+            let t0 = std::time::Instant::now();
+            // fluids: what to draw is made once per step on the fluid's thread (Fluid::render);
+            // here it is only handed over, so a frame stays cheap however big the fluid is
+            let sun = {
+                let (y, p) = ((light.yaw as f32).to_radians(), (light.pitch as f32).to_radians());
+                [p.cos() * y.cos(), p.cos() * y.sin(), p.sin()]
+            };
+            let on_gpu = self.gpu3d.is_some();
+            let mut volume = None;
+            if let Some(f) = fluid {
+                let d = f.dims();
+                let water = f.kind == simtara_fields::Kind::Water;
+                let made;
+                let r: &simtara_fields::RenderData = match f.render.as_deref() {
+                    Some(r) => r,
+                    None => {
+                        let mut copy = simtara_fields::Fluid::default();
+                        copy.clone_from(f);
+                        copy.want_render = true;
+                        copy.sun = sun;
+                        copy.make_render();
+                        made = copy.render.unwrap_or_default();
+                        &made
+                    }
+                };
+                volume = Some(view3d::Volume {
+                    dims: [d.nx as u32, d.ny as u32, d.nz as u32],
+                    size: f.extent(),
+                    data: r.rgba.clone(),
+                    water_radius: if water { f.cell * 0.55 } else { 0.0 },
+                    caustics: r.caustics.clone(),
+                    liquid: (water && !r.liquid.is_empty()).then(|| r.liquid.clone()),
+                    generation: r.generation,
+                    blend: {
+                        // a new step: remember when it came and how long steps take
+                        if self.step_seen.0 != r.generation {
+                            let gap = self.step_seen.1.elapsed().as_secs_f32();
+                            self.step_gap = if self.step_seen.0 == 0 { gap.min(0.2) } else { self.step_gap * 0.7 + gap.min(1.0) * 0.3 };
+                            self.step_seen = (r.generation, std::time::Instant::now());
+                        }
+                        let playing = self.sim.run_state() == RunState::Running;
+                        if playing { (self.step_seen.1.elapsed().as_secs_f32() / self.step_gap.max(1e-3)).min(1.0) } else { 1.0 }
+                    },
+                });
+                if self.sim.run_state() == RunState::Running {
+                    ui.ctx().request_repaint();
+                }
+                if on_gpu {
+                    for (i, p) in r.spray.iter().enumerate() {
+                        items.push(view3d::Item { id: u64::MAX - i as u64, pos: *p, color: water_colour(1.0), size: 1.0, heading: 0.0, shape: "spray".into() });
+                    }
+                } else if water {
+                    // the CPU painter cannot draw a surface: it shows the particles
+                    for (i, (p, foam)) in f.water_points().into_iter().enumerate() {
+                        items.push(view3d::Item { id: u64::MAX - i as u64, pos: p, color: water_colour(foam), size: 1.0, heading: 0.0, shape: String::new() });
+                    }
+                }
+            }
+            let out = view3d::draw(ui, resp.rect, &resp, &items, &mut cam, &light, &self.models, self.selected, self.gpu3d.as_mut(), volume.as_ref());
+            self.draw_ms = self.draw_ms * 0.9 + t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
             if resp.clicked() {
                 self.selected = out.hovered;
             }
@@ -808,7 +950,7 @@ impl BuildView {
                     .collect();
                 painter.text(resp.rect.left_bottom() + egui::vec2(80.0, -8.0), egui::Align2::LEFT_BOTTOM, format!("#{} {}   {}", th.id, th.kind, props.join("  ")), egui::FontId::monospace(12.0), egui::Color32::WHITE);
             }
-            painter.text(resp.rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · 3D · drag to turn, scroll to zoom"), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
+            painter.text(resp.rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, format!("{n} things · 3D · {} {:.1} ms · {:.0} fps · drag to turn, scroll to zoom", if self.gpu3d.is_some() { "GPU" } else { "CPU" }, self.draw_ms, self.fps), egui::FontId::monospace(11.0), egui::Color32::from_gray(150));
             self.pick = new_pick;
             self.show_links = Some(links_on);
             let cam_changed = (cam.yaw, cam.pitch, cam.distance, cam.fov, cam.follow) != (cam0.yaw, cam0.pitch, cam0.distance, cam0.fov, cam0.follow);
@@ -970,8 +1112,9 @@ impl BuildView {
                 }
             }
         });
-        if t.things.is_empty() {
-            ui.weak("Nothing exists yet. Create things with spawn{...} in setup().");
+        let fluid = self.sim.world().get::<simtara_fields::Fluid>().filter(|f| f.ready());
+        if t.things.is_empty() && fluid.is_none() {
+            ui.weak("Nothing exists yet. Create things with spawn{...} or a fluid{...} in setup().");
             return;
         }
         let rows: Vec<simtara_things::Thing> = t.of_kind(if self.kind_filter.is_empty() { None } else { Some(self.kind_filter.as_str()) }).take(200).cloned().collect();
